@@ -61,7 +61,7 @@ quark generate <model> [--ckpt best|latest|<path>] [--prompt ...] [--samples N] 
 ## Status
 
 - Phase 0 (scaffold): done.
-- Phase 1 (baseline GPT, data, trainer, generation, notebooks): done. See the plan for the exit-criteria run.
+- Phase 1 (baseline GPT, data, trainer, generation, notebooks): done, exit criteria met on Colab (val loss 1.48, resume from Drive verified).
 - Phase 2: component registry done ([design](docs/component_registry.md)); the baseline is now built from registered components.
 - First add-ons done: Muon, WSD, QK-norm, z-loss, ALiBi, NoPE, ReLU² (`quark components list`).
 - Next: `quark compare` (paired-seed ablations), then DaRoPE, grad checkpointing and 8-bit AdamW.

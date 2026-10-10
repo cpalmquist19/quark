@@ -486,7 +486,7 @@ Optimizer implementations (Muon, etc.) are vendored as small, readable files wit
 **Phase 0: Scaffold — ✅ done 2026-10-09**
 - `pyproject`, package layout, config schema, CLI skeleton, `gpu detect`, tests setup, git init. Project venv via `uv sync` (Python 3.12, torch 2.14.1+cu130); `quark version`, `quark gpu detect [--save]`, `quark gpu list`; built-in presets in `src/quark/hardware/presets/`, user-saved profiles in `./hardware/`; 14 tests passing including a real-GPU detection test.
 
-**Phase 1: Baseline end-to-end (the most important milestone)**
+**Phase 1: Baseline end-to-end (the most important milestone) — ✅ done 2026-10-10** (17.3M model on Colab T4: val loss 1.48 after 200M tokens, coherent stories; kill-and-resume from Drive verified)
 - Baseline GPT (RoPE, RMSNorm, SwiGLU, MHA via SDPA, tied head), AdamW + cosine.
 - Data prepare (HF + local text → memmap), TinyStories as the first dataset.
 - Trainer with all of Section 11 (stats, live plots, best/latest checkpoints, early stopping, resume).
