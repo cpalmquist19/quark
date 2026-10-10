@@ -33,7 +33,11 @@ def make_figure(records: list[dict], title: str = "") -> Figure:
     x, y = col(train, "loss_ema")
     ax_loss.plot(x, y, color="tab:blue", linewidth=2, label="train (EMA)")
     x, y = col(evals, "val_loss")
-    ax_loss.plot(x, y, "o-", color="tab:orange", markersize=4, label="val")
+    ax_loss.plot(x, y, "o-", color="tab:orange", markersize=4, label="val" + (" (mix)" if evals and any(k.startswith("val_loss/") for k in evals[-1]) else ""))
+    sources = sorted({k.removeprefix("val_loss/") for r in evals for k in r if k.startswith("val_loss/")})
+    for i, name in enumerate(sources):
+        x, y = col(evals, f"val_loss/{name}")
+        ax_loss.plot(x, y, "--", color=f"C{(i + 2) % 10}", linewidth=1, alpha=0.8, label=f"val: {name}")
     ax_loss.set(title="Loss", xlabel="tokens (M)", ylabel="cross-entropy")
     ax_loss.legend()
     if train:

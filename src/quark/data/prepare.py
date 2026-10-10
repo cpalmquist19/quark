@@ -57,31 +57,8 @@ def prepare_dataset(
     tok.save(str(out / "tokenizer.json"))
     vocab_size = tok.get_vocab_size()
     eot = eot_id(tok)
-    dtype = np.uint16 if vocab_size <= 65_535 else np.uint32
-
-    counts = {"train": [0, 0], "val": [0, 0]}  # [docs, tokens]
-    files = {split: open(out / f"{split}.bin.tmp", "wb") for split in counts}
-    try:
-        stream = docs()
-        while batch := list(islice(stream, BATCH_DOCS)):
-            for text, enc in zip(batch, tok.encode_batch(batch)):
-                split = "val" if is_val(text, data.val_fraction) else "train"
-                ids = np.asarray(enc.ids + [eot], dtype=dtype)
-                files[split].write(ids.tobytes())
-                counts[split][0] += 1
-                counts[split][1] += len(ids)
-            if progress is not None:
-                progress(counts["train"][0] + counts["val"][0], counts["train"][1] + counts["val"][1])
-            if data.token_limit is not None and counts["train"][1] + counts["val"][1] >= data.token_limit:
-                break
-    finally:
-        for fh in files.values():
-            fh.close()
-    for split in counts:
-        os.replace(out / f"{split}.bin.tmp", out / f"{split}.bin")
-
-    if counts["val"][1] == 0 or counts["train"][1] == 0:
-        raise ValueError(f"empty split after tokenizing {data.source}: {counts}; check val_fraction / source")
+    dtype = token_dtype(vocab_size)
+    counts = tokenize_to(out, docs(), tok, data.val_fraction, data.token_limit, progress, label=data.source)
 
     meta = {
         "source": data.source,
@@ -106,9 +83,53 @@ def prepare_dataset(
     return meta
 
 
+def token_dtype(vocab_size: int) -> type:
+    return np.uint16 if vocab_size <= 65_535 else np.uint32
+
+
+def tokenize_to(
+    out: Path,
+    docs,
+    tok,
+    val_fraction: float,
+    token_limit: int | None = None,
+    progress: Callable[[int, int], None] | None = None,
+    label: str = "source",
+) -> dict[str, list[int]]:
+    """Write train.bin / val.bin in `out` from an iterable of texts. Returns {split: [docs, tokens]}."""
+    eot = eot_id(tok)
+    dtype = token_dtype(tok.get_vocab_size())
+    counts = {"train": [0, 0], "val": [0, 0]}  # [docs, tokens]
+    files = {split: open(out / f"{split}.bin.tmp", "wb") for split in counts}
+    try:
+        stream = iter(docs)
+        while batch := list(islice(stream, BATCH_DOCS)):
+            for text, enc in zip(batch, tok.encode_batch(batch)):
+                split = "val" if is_val(text, val_fraction) else "train"
+                ids = np.asarray(enc.ids + [eot], dtype=dtype)
+                files[split].write(ids.tobytes())
+                counts[split][0] += 1
+                counts[split][1] += len(ids)
+            if progress is not None:
+                progress(counts["train"][0] + counts["val"][0], counts["train"][1] + counts["val"][1])
+            if token_limit is not None and counts["train"][1] + counts["val"][1] >= token_limit:
+                break
+    finally:
+        for fh in files.values():
+            fh.close()
+    for split in counts:
+        os.replace(out / f"{split}.bin.tmp", out / f"{split}.bin")
+    if counts["val"][1] == 0 or counts["train"][1] == 0:
+        raise ValueError(f"empty split after tokenizing {label}: {counts}; check val_fraction / source")
+    return counts
+
+
 def default_data_dir(data: DataConfig, root: str | Path = "data") -> Path:
     """e.g. data/tinystories-bpe8192 for roneneldan/TinyStories with the default tokenizer, or
-    data/fineweb-edu-sample-10bt-500m-bpe8192 with subset "sample-10BT" and token_limit 500M."""
+    data/fineweb-edu-sample-10bt-500m-bpe8192 with subset "sample-10BT" and token_limit 500M. For a mix,
+    data/mix-<name>-<tokenizer> (the same folder quark.data.mix.mix_dir builds)."""
+    if data.mix:
+        return Path(root) / f"mix-{data.mix}-{data.tokenizer.tag()}"
     parts = [Path(data.source.rstrip("/\\")).name or "data"]
     if data.subset:
         parts.append(data.subset)

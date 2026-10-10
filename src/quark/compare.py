@@ -182,6 +182,7 @@ def _write_result(path: Path, trainer, result, arm: str, seed: int) -> None:
         "steps": result.steps,
         "tokens": result.tokens,
         "final_val": result.last_val,
+        "final_val_parts": dict(trainer.last_val_parts),  # per source, when training on a mix
         "best_val": result.best_val,
         "params": trainer.raw_model.num_params(),
         "params_non_embedding": trainer.raw_model.num_params(non_embedding=True),
@@ -235,7 +236,9 @@ def summarize(spec: CompareSpec, out: Path) -> dict:
         speed_ratio = speed / ref_speed if speed and ref_speed else None
         mean_d = _mean(paired)
         se = statistics.stdev(paired) / math.sqrt(len(paired)) if len(paired) >= 2 else None
+        parts = _source_deltas(runs, ref_runs, arm == ref)
         arms[arm] = {
+            "sources": parts,
             "seeds_done": sorted(runs),
             "final_val": finals,
             "mean_final_val": _mean(list(finals.values())),
@@ -265,6 +268,26 @@ def summarize(spec: CompareSpec, out: Path) -> dict:
         "late_slope_per_log_tokens": slope,
         "arms": arms,
     }
+
+
+def _source_deltas(runs: dict[int, dict], ref_runs: dict[int, dict], is_ref: bool) -> dict[str, dict]:
+    """Per-source final val loss (mean over seeds) and paired Δ vs the reference, for mixes."""
+    names = sorted({n for r in runs.values() for n in r.get("final_val_parts", {})})
+    out = {}
+    for name in names:
+        vals = [r["final_val_parts"][name] for r in runs.values() if name in r.get("final_val_parts", {})]
+        paired = [
+            r["final_val_parts"][name] - ref_runs[s]["final_val_parts"][name]
+            for s, r in runs.items()
+            if not is_ref and s in ref_runs and name in r.get("final_val_parts", {})
+            and name in ref_runs[s].get("final_val_parts", {})
+        ]
+        out[name] = {
+            "mean": _mean(vals),
+            "delta": _mean(paired),
+            "delta_se": statistics.stdev(paired) / math.sqrt(len(paired)) if len(paired) >= 2 else None,
+        }
+    return out
 
 
 def _verdict(is_ref: bool, paired: list[float], se: float | None, diverged: bool) -> str:
@@ -337,6 +360,21 @@ def render_report(s: dict) -> str:
             num(a["peak_mem_gb"], "{:.2f} GB"), a["verdict"],
         ]
         lines.append("| " + " | ".join(cells) + " |")
+    sources = sorted({n for a in s["arms"].values() for n in a.get("sources", {})})
+    if sources:
+        lines += ["", "Δ val loss by source (equal tokens; mean over seeds ± SE; the reference row shows its loss):", "",
+                  "| arm | " + " | ".join(sources) + " |", "|---|" + "---|" * len(sources)]
+        for arm, a in s["arms"].items():
+            cells = []
+            for name in sources:
+                d = a["sources"].get(name)
+                if d is None:
+                    cells.append("–")
+                elif arm == s["reference"]:
+                    cells.append(num(d["mean"], "{:.4f}"))
+                else:
+                    cells.append(num(d["delta"]) + (f" ± {d['delta_se']:.4f}" if d["delta_se"] else ""))
+            lines.append(f"| {arm} | " + " | ".join(cells) + " |")
     lines += ["", "Final val loss per seed:", "", "| arm | " + " | ".join(f"seed {x}" for x in s["seeds"]) + " |",
               "|---|" + "---|" * len(s["seeds"])]
     for arm, a in s["arms"].items():

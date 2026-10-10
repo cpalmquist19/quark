@@ -1,9 +1,10 @@
-"""Writes the notebooks from one cell list: quark_local.ipynb, quark_colab.ipynb (train one model) and
-quark_compare_colab.ipynb (run a component comparison on Colab).
+"""Writes the notebooks from one cell list: quark_local.ipynb, quark_colab.ipynb (train one model),
+quark_compare_colab.ipynb (run a component comparison on Colab) and quark_data_colab.ipynb (build a data
+mix on a CPU-only Colab runtime).
 
 Phase 1 hand-written templates (plan §10). Targets share every cell except the target-specific ones,
 so they can't drift apart. Phase 4 replaces this with `quark notebook`. The compare notebook embeds
-experiments/first-batch.yaml as its default spec.
+experiments/first-batch.yaml as its default spec; the data notebook embeds mixes/chatbot-v1.yaml.
 
     uv run python notebooks/build_notebooks.py
 """
@@ -17,10 +18,19 @@ HERE = Path(__file__).parent
 REPO = "https://github.com/cpalmquist19/quark.git"
 DEFAULT_SPEC = (HERE.parent / "experiments" / "first-batch.yaml").read_text(encoding="utf-8").strip()
 assert "'''" not in DEFAULT_SPEC  # it's embedded in a ''' string in the compare notebook
+DEFAULT_MIX = (HERE.parent / "mixes" / "chatbot-v1.yaml").read_text(encoding="utf-8").strip()
+assert "'''" not in DEFAULT_MIX
 
 # (targets, kind, source). targets: "both" (= local + colab), a target name, or a tuple of names;
 # kind: "md" | "code".
 CELLS: list[tuple[str | tuple[str, ...], str, str]] = [
+    ("data", "md", """# Quark: build a data mix on Google Colab (CPU)
+
+Streams each source of a mix recipe, keeps the documents its filter accepts, then trains one tokenizer and tokenizes every source (`docs/domain_data_survey.md`, plan §18). Everything is saved to **Google Drive**, where the training and compare notebooks pick it up.
+
+**No GPU needed:** *Runtime → Change runtime type → CPU*, so this doesn't use GPU quota. Then *Runtime → Run all*.
+
+**Long scans are resumable.** Collection saves its stream position every ~20,000 documents. If the session ends, *Run all* again and it continues where it stopped. Keep the browser tab open while it runs."""),
     ("compare", "md", """# Quark: compare components on Google Colab
 
 Trains every **arm** of a comparison once per **seed** on the same token budget and reports how each arm differs from the reference, with paired seeds to cancel run-to-run noise (plan §18.2). Data, runs and the report live on **Google Drive**.
@@ -43,16 +53,16 @@ Trains a Quark model on Colab's free T4 GPU. Checkpoints, data and plots live on
 
     (("local", "colab", "compare"), "md", "## 1. Environment check"),
     (("colab", "compare"), "code", """!nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv"""),
-    (("colab", "compare"), "md", "## 2. Google Drive (persistent storage)"),
-    (("colab", "compare"), "code", """from google.colab import drive
+    (("colab", "compare", "data"), "md", "## 2. Google Drive (persistent storage)"),
+    (("colab", "compare", "data"), "code", """from google.colab import drive
 drive.mount("/content/drive")
 
 from pathlib import Path
 DRIVE_ROOT = Path("/content/drive/MyDrive/quark")  # models, checkpoints and cached data live here
 DRIVE_ROOT.mkdir(parents=True, exist_ok=True)
 print("Drive folder:", DRIVE_ROOT)"""),
-    (("colab", "compare"), "md", "## 3. Install Quark"),
-    (("colab", "compare"), "code", """QUARK_REF = "main"  # a branch, tag or commit of the quark repo
+    (("colab", "compare", "data"), "md", "## 3. Install Quark"),
+    (("colab", "compare", "data"), "code", """QUARK_REF = "main"  # a branch, tag or commit of the quark repo
 %pip install -q "git+""" + REPO + """@{QUARK_REF}\""""),
 
     (("local", "colab", "compare"), "code", """import sys
@@ -147,24 +157,40 @@ if not (DATA_DIR / "meta.json").exists():
     print(f"preparing {DATA_SOURCE} -> {DATA_DIR} ...")
     prepare_dataset(cfg.data, DATA_DIR, progress=lambda d, n: d % 100_000 == 0 and print(f"  {d:,} docs, {n / 1e6:,.0f}M tokens"))"""),
     (("colab", "compare"), "code", """import shutil
-from quark.data import TokenData, default_data_dir, prepare_dataset
+from quark.data import default_data_dir, prepare_dataset
 
 DRIVE_DATA_DIR = default_data_dir(cfg.data, root=DATA_ROOT)
 DATA_DIR = LOCAL_DATA_ROOT / DRIVE_DATA_DIR.name  # local copy: much faster random reads than Drive
 if not (DRIVE_DATA_DIR / "meta.json").exists():
+    if cfg.data.mix:
+        raise FileNotFoundError(f"mix {cfg.data.mix!r} isn't prepared on Drive yet ({DRIVE_DATA_DIR}); "
+                                "build it with notebooks/quark_data_colab.ipynb first")
     print(f"preparing {cfg.data.source} -> {DATA_DIR} (then caching to Drive) ...")
     prepare_dataset(cfg.data, DATA_DIR, progress=lambda d, n: d % 100_000 == 0 and print(f"  {d:,} docs, {n / 1e6:,.0f}M tokens"))
     shutil.copytree(DATA_DIR, DRIVE_DATA_DIR, dirs_exist_ok=True)
 elif not (DATA_DIR / "meta.json").exists():
     print(f"copying cached data from Drive to {DATA_DIR} ...")
-    shutil.copytree(DRIVE_DATA_DIR, DATA_DIR, dirs_exist_ok=True)"""),
-    (("local", "colab", "compare"), "code", """data = TokenData(DATA_DIR)
+    shutil.copytree(DRIVE_DATA_DIR, DATA_DIR, dirs_exist_ok=True, ignore=shutil.ignore_patterns("raw"))"""),
+    (("local", "colab", "compare"), "code", """from quark.data import MixData, load_data
+
+data = load_data(DATA_DIR)
 meta = data.meta
-print(f"vocab {meta['vocab_size']:,} | train {meta['train_tokens'] / 1e6:,.1f}M tokens ({meta['train_docs']:,} docs) "
-      f"| val {meta['val_tokens'] / 1e6:,.2f}M tokens ({meta['val_docs']:,} docs)")
-epochs = cfg.train.max_tokens / meta["train_tokens"]
-print(f"planned training: {epochs:.2f} epochs" + ("  (multi-epoch: watch for overfitting)" if epochs > 1 else ""))
-print("\\nsample (decoded from val):\\n" + data.tokenizer().decode(data.val[:150].tolist()))"""),
+if isinstance(data, MixData):
+    weights = data.resolve_weights(cfg.data.weights)
+    print(f"mix {meta['name']} | vocab {meta['vocab_size']:,}")
+    for name, src in meta["sources"].items():
+        w = weights.get(name, 0.0)
+        epochs = w * cfg.train.max_tokens / max(1, src["train_tokens"])
+        print(f"  {name:18s} train {src['train_tokens'] / 1e6:7,.1f}M | val {src['val_tokens'] / 1e6:5,.2f}M | "
+              f"weight {w:4.0%} | {epochs:.2f} epochs planned")
+    sample_tokens = next(iter(data.sources.values())).val
+else:
+    print(f"vocab {meta['vocab_size']:,} | train {meta['train_tokens'] / 1e6:,.1f}M tokens ({meta['train_docs']:,} docs) "
+          f"| val {meta['val_tokens'] / 1e6:,.2f}M tokens ({meta['val_docs']:,} docs)")
+    epochs = cfg.train.max_tokens / meta["train_tokens"]
+    print(f"planned training: {epochs:.2f} epochs" + ("  (multi-epoch: watch for overfitting)" if epochs > 1 else ""))
+    sample_tokens = data.val
+print("\\nsample (decoded from val):\\n" + data.tokenizer().decode(sample_tokens[:150].tolist()))"""),
 
     ("both", "md", "## Model and memory check\nOne real training step on the GPU: the actual peak memory, not an estimate."),
     ("both", "code", """from quark.train import dry_run
@@ -226,6 +252,37 @@ summary = run_compare(spec, DATA_DIR, EXP_DIR, hardware=hw, live_plot=True)"""),
 display(Markdown((EXP_DIR / "report.md").read_text(encoding="utf-8")))
 if (EXP_DIR / "curves.png").exists():
     display(Image(filename=str(EXP_DIR / "curves.png")))"""),
+
+    ("data", "md", """## Settings
+The mix recipe: sources, filters and token targets. Training weights are chosen later, in the training config or compare spec. Changing a source's filter after collecting it means deleting its folder under `raw/` first."""),
+    ("data", "code", """DATA_ROOT = DRIVE_ROOT / "data"
+
+# A raw string, because the filters' regexes contain backslashes.
+RECIPE_YAML = r'''
+""" + DEFAULT_MIX + """
+'''"""),
+    ("data", "code", """import yaml
+from quark.data.mix import MixRecipe, collect_status, mix_dir
+
+recipe = MixRecipe.model_validate(yaml.safe_load(RECIPE_YAML))
+MIX_DIR = mix_dir(recipe, DATA_ROOT)
+print(f"mix {recipe.name} -> {MIX_DIR}")
+for name, st in collect_status(recipe, DATA_ROOT).items():
+    print(f"  {name:18s} {st['tokens'] / 1e6:8,.1f}M / {st['target'] / 1e6:,.0f}M tokens  {'done' if st['done'] else ''}")"""),
+    ("data", "md", "## Collect\nOne pass per stream: all FineWeb-Edu sources are filled from the same scan. Progress prints at every save."),
+    ("data", "code", """from quark.data.mix import collect
+
+status = collect(recipe, DATA_ROOT)"""),
+    ("data", "md", "## Prepare\nTrains the shared tokenizer, then tokenizes each source into its own train/val files."),
+    ("data", "code", """from quark.data.mix import prepare_mix
+
+if (MIX_DIR / "meta.json").exists():
+    print("already prepared:", MIX_DIR)
+else:
+    meta = prepare_mix(recipe, DATA_ROOT, progress=lambda name, d, t: d % 50_000 == 0 and print(f"  {name}: {d:,} docs"))
+    for name, src in meta["sources"].items():
+        print(f"{name:18s} train {src['train_tokens'] / 1e6:7,.1f}M tokens ({src['train_docs']:,} docs) | val {src['val_tokens'] / 1e6:.2f}M")"""),
+    ("data", "md", "Done. To train on this mix, set `data.mix` to the mix name (and the same `data.tokenizer`) in a model config or compare spec, plus `data.weights` to choose how often each source is used."),
 ]
 
 
@@ -255,7 +312,12 @@ def build(target: str) -> dict:
     return {"cells": cells, "metadata": metadata, "nbformat": 4, "nbformat_minor": 5}
 
 
-NOTEBOOKS = {"local": "quark_local.ipynb", "colab": "quark_colab.ipynb", "compare": "quark_compare_colab.ipynb"}
+NOTEBOOKS = {
+    "local": "quark_local.ipynb",
+    "colab": "quark_colab.ipynb",
+    "compare": "quark_compare_colab.ipynb",
+    "data": "quark_data_colab.ipynb",
+}
 
 if __name__ == "__main__":
     for target, filename in NOTEBOOKS.items():

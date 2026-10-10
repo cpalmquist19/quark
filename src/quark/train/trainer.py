@@ -19,7 +19,7 @@ import torch
 import quark
 from quark.components import check, make_optimizer, make_schedule, raise_for_errors
 from quark.config import HardwareProfile, QuarkConfig
-from quark.data import BatchLoader, TokenData
+from quark.data import BatchLoader, MixData, MixtureLoader, load_data
 from quark.model import build_model
 from quark.train.checkpoint import load_checkpoint, prune_step_checkpoints, rng_state, save_checkpoint, set_rng_state
 from quark.train.monitors import EarlyStopper, GapMonitor, SpikeDetector
@@ -27,6 +27,7 @@ from quark.train.plots import make_figure, read_metrics, save_plot
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 SESSION_MARGIN_MIN = 20  # stop this long before a session's hard limit, to save and sync to Drive
+MAX_SOURCE_EPOCHS = 4  # repeated text loses value beyond this (ml_papers3 A8); warn when a source would exceed it
 
 
 class ConfigMismatchError(RuntimeError):
@@ -76,15 +77,27 @@ class Trainer:
         if self.device.type == "cuda":
             torch.set_float32_matmul_precision("high")  # TF32 where the GPU supports it
 
-        # Data
-        self.data = TokenData(self.data_dir)
+        # Data: one prepared source, or a mix (quark.data.mix) with per-source weights and validation
+        self.data = load_data(self.data_dir)
         if self.data.vocab_size > cfg.model.vocab_size:
             raise ValueError(
                 f"tokenizer has {self.data.vocab_size} tokens but model.vocab_size is {cfg.model.vocab_size}"
             )
-        seq = cfg.model.seq_len
-        self.train_loader = BatchLoader(self.data.train, seq, self.tcfg.micro_batch, self.tcfg.seed, True, self.device)
-        self.val_loader = BatchLoader(self.data.val, seq, self.tcfg.micro_batch, 0, False, self.device)
+        self.is_mix = isinstance(self.data, MixData)
+        if bool(cfg.data.mix) != self.is_mix:
+            raise ValueError(
+                f"{self.data_dir} is {'a mix' if self.is_mix else 'a single source'} but data.mix is {cfg.data.mix!r}"
+            )
+        seq, micro = cfg.model.seq_len, self.tcfg.micro_batch
+        if self.is_mix:
+            self.mix_weights = self.data.resolve_weights(cfg.data.weights)
+            self.eval_weights = _normalized(cfg.data.eval_weights or {n: 1.0 for n in self.data.sources}, self.data)
+            self.train_loader = MixtureLoader(self.data, self.mix_weights, seq, micro, self.tcfg.seed, self.device)
+            self.val_loaders = {n: BatchLoader(s.val, seq, micro, 0, False, self.device) for n, s in self.data.sources.items()}
+        else:
+            self.train_loader = BatchLoader(self.data.train, seq, micro, self.tcfg.seed, True, self.device)
+            self.val_loaders = {"": BatchLoader(self.data.val, seq, micro, 0, False, self.device)}
+        self.last_val_parts: dict[str, float] = {}
 
         # Model and optimizer
         self.raw_model = build_model(cfg.model, self.hardware).to(self.device)
@@ -119,6 +132,19 @@ class Trainer:
         if resume_from is not None:
             self._resume(Path(resume_from), allow_config_change)
         self._init_run_dir()
+        for name, epochs in self.planned_source_epochs().items():
+            if epochs > MAX_SOURCE_EPOCHS:
+                message = (f"source {name!r} would be repeated {epochs:.1f} times; text loses value after ~{MAX_SOURCE_EPOCHS} "
+                           f"epochs. Collect more of it, or lower its weight.")
+                self.log(f"warning: {message}")
+                self._event("repetition_warning", message)
+
+    def planned_source_epochs(self) -> dict[str, float]:
+        """For a mix: how many times each source's training tokens will be seen by the end of the run."""
+        if not self.is_mix:
+            return {}
+        total = self.total_steps * self.tokens_per_step
+        return {n: w * total / max(1, len(self.data.sources[n].train)) for n, w in self.mix_weights.items()}
 
     # --- setup -----------------------------------------------------------------------------------
 
@@ -272,13 +298,21 @@ class Trainer:
 
     @torch.no_grad()
     def evaluate(self) -> float:
+        """Validation loss. For a mix: the eval-weighted mean of per-source losses (in last_val_parts),
+        so the headline number means the same thing for every choice of training weights."""
         self.model.eval()
-        losses = []
-        for x, y in self.val_loader.fixed_batches(self.tcfg.eval_batches):
-            with self._autocast():
-                losses.append(self.model(x, y).item())
+        parts = {}
+        for name, loader in self.val_loaders.items():
+            losses = []
+            for x, y in loader.fixed_batches(self.tcfg.eval_batches):
+                with self._autocast():
+                    losses.append(self.model(x, y).item())
+            parts[name] = sum(losses) / len(losses)
         self.model.train()
-        return sum(losses) / len(losses)
+        if not self.is_mix:
+            return parts[""]
+        self.last_val_parts = parts
+        return sum(w * parts[n] for n, w in self.eval_weights.items())
 
     def _evaluate_and_check(self, final: bool = False) -> str | None:
         """Evaluate, log, save best, update plots. Returns a stop reason, if any."""
@@ -290,22 +324,25 @@ class Trainer:
             save_checkpoint(self._state(), self.run_dir / "best.pt")
         gap_warning = self.gap.update(self.loss_ema, val) if self.loss_ema is not None else None
         epoch = self.train_loader.epoch_progress
-        self._write_metrics(
-            {
-                "type": "eval",
-                "step": self.step,
-                "tokens": self.tokens,
-                "val_loss": val,
-                "val_ppl": math.exp(min(val, 20)),
-                "train_loss_ema": self.loss_ema,
-                "best_val": self.stopper.best,
-                "epoch": epoch,
-                "time_s": self.train_time_s + (time.time() - self._fit_started if self._fit_started else 0.0),
-            }
-        )
+        record = {
+            "type": "eval",
+            "step": self.step,
+            "tokens": self.tokens,
+            "val_loss": val,
+            "val_ppl": math.exp(min(val, 20)),
+            "train_loss_ema": self.loss_ema,
+            "best_val": self.stopper.best,
+            "epoch": epoch,
+            "time_s": self.train_time_s + (time.time() - self._fit_started if self._fit_started else 0.0),
+        }
+        if self.is_mix:
+            record.update({f"val_loss/{n}": v for n, v in self.last_val_parts.items()})
+            record.update({f"epochs/{n}": e for n, e in self.train_loader.source_epochs.items()})
+        self._write_metrics(record)
+        parts = "".join(f" | {n} {v:.3f}" for n, v in self.last_val_parts.items()) if self.is_mix else ""
         self.log(
             f"eval  step {self.step:>7,} | val {val:.4f} (ppl {math.exp(min(val, 20)):.2f}) | "
-            f"best {self.stopper.best:.4f}{'  * saved best.pt' if improved else ''}"
+            f"best {self.stopper.best:.4f}{'  * saved best.pt' if improved else ''}{parts}"
         )
         if gap_warning:
             self.log(f"warning: {gap_warning}")
@@ -465,15 +502,29 @@ class Trainer:
     def _banner(self) -> str:
         m = self.raw_model
         gpu = self.hardware.gpu_name if self.hardware else self.device.type
+        total = self.total_steps * self.tokens_per_step
+        if self.is_mix:
+            epochs = self.planned_source_epochs()
+            data = "mix " + ", ".join(
+                f"{n} {w:.0%} ({len(self.data.sources[n].train) / 1e6:,.0f}M tokens, {epochs[n]:.2f} ep)"
+                for n, w in self.mix_weights.items()
+            )
+        else:
+            data = f"{total / max(1, len(self.data.train)):.2f} epochs of {len(self.data.train) / 1e6:.0f}M train tokens"
         return (
             f"training {self.cfg.name}: {m.num_params() / 1e6:.2f}M params "
             f"({m.num_params(non_embedding=True) / 1e6:.2f}M non-embedding) on {gpu}, {self.precision}\n"
-            f"  {self.tokens_per_step:,} tokens/step x {self.total_steps:,} steps = "
-            f"{self.total_steps * self.tokens_per_step / 1e6:.0f}M tokens "
-            f"({self.total_steps * self.tokens_per_step / max(1, len(self.data.train)):.2f} epochs of "
-            f"{len(self.data.train) / 1e6:.0f}M train tokens)\n"
+            f"  {self.tokens_per_step:,} tokens/step x {self.total_steps:,} steps = {total / 1e6:.0f}M tokens ({data})\n"
             f"  run dir: {self.run_dir}"
         )
+
+
+def _normalized(weights: dict[str, float], data: MixData) -> dict[str, float]:
+    unknown = set(weights) - set(data.sources)
+    if unknown:
+        raise ValueError(f"data.eval_weights names unknown sources {sorted(unknown)} (mix has {sorted(data.sources)})")
+    total = sum(weights.values())
+    return {n: w / total for n, w in weights.items() if w > 0}
 
 
 def dry_run(cfg: QuarkConfig, data_dir: str | Path, steps: int = 3) -> dict:

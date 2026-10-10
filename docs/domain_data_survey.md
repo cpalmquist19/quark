@@ -93,5 +93,12 @@ colors, counting, shapes, feelings, routines).
    - *Neurodiversity-affirming content* would need source curation (down-weighting deficit-focused sources)
      and possibly a curated or synthetic supplement.
 
-Open questions for the user (2026-10-10): which of the two meanings of "pre-K to kindergarten level knowledge"
-is the goal, and which neurodivergence perspective the model should have.
+## Decisions (2026-10-10)
+
+- **Early childhood: knowledge *about* early childhood** (option b): development, teaching young children,
+  parenting. FineWeb-Edu's filtered slice covers it; no paid synthetic generation.
+- **Neurodivergence: neurodiversity-affirming**, because **children will talk to the model**. The
+  `neurodivergence` source in `mixes/chatbot-v1.yaml` leaves out sites and phrasings with cure, deficit or
+  vaccine-misinformation framing. Those lists are a first pass for review. A positive signal (preferring
+  affirming, first-person and self-advocacy writing) would be the next refinement.
+- Child-appropriate language comes partly from Cosmopedia's `story_children` stories, at a low weight.

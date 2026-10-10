@@ -197,13 +197,29 @@ class DataConfig(_Strict):
     subset: str | None = None  # HF dataset config, e.g. "sample-10BT" for HuggingFaceFW/fineweb-edu
     split: str = "train"  # HF split to read; train/val are split by Quark (hash-based)
     token_limit: int | None = Field(None, gt=0)  # stop after this many tokens; HF sources are then streamed
+    # Data mixtures (quark.data.mix): train on a prepared mix instead of `source`.
+    mix: str | None = None  # recipe name, e.g. "chatbot-v1" (mixes/chatbot-v1.yaml); data dir mix-<name>-<tokenizer>
+    weights: dict[str, float] = Field(default_factory=dict)  # share of training sequences per source; {} = by size
+    eval_weights: dict[str, float] = Field(default_factory=dict)  # headline val loss = weighted mean; {} = equal
+
+    @model_validator(mode="after")
+    def _check_mix(self) -> DataConfig:
+        if (self.weights or self.eval_weights) and not self.mix:
+            raise ValueError("data.weights / data.eval_weights only apply to a mix (set data.mix)")
+        for name, table in (("weights", self.weights), ("eval_weights", self.eval_weights)):
+            if any(w < 0 for w in table.values()) or (table and sum(table.values()) <= 0):
+                raise ValueError(f"data.{name} must be non-negative with a positive sum")
+        return self
     text_field: str = "text"
     tokenizer: TokenizerConfig = Field(default_factory=TokenizerConfig)
     val_fraction: float = Field(0.005, gt=0, lt=0.5)
 
 
 # Fields added after configs were already in use: config_hash() skips them while unset.
-HASH_OMIT_IF_DEFAULT = (("model", "params"), ("train", "params"), ("data", "subset"), ("data", "token_limit"))
+HASH_OMIT_IF_DEFAULT = (
+    ("model", "params"), ("train", "params"), ("data", "subset"), ("data", "token_limit"), ("data", "mix"),
+    ("data", "weights"), ("data", "eval_weights"),
+)
 
 
 class QuarkConfig(_Strict):

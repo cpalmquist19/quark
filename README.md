@@ -99,6 +99,35 @@ Invalid combinations fail before training starts, with the reason (for example
 `unknown position 'ropee'; did you mean 'rope'?` or `requires attention:mha`). Grouped-query attention is
 `model.n_kv_heads`, not a component.
 
+## Data mixtures
+
+The chatbot target trains on several sources at once: general educational English plus upweighted
+education, early-childhood and (neurodiversity-affirming) neurodivergence text. A **recipe** such as
+[mixes/chatbot-v1.yaml](mixes/chatbot-v1.yaml) lists the sources, each a stream with an optional filter
+(domain keywords, dataset columns, excluded sites or phrasings) and a token target.
+
+- **Build a mix on Colab, CPU only:** [notebooks/quark_data_colab.ipynb](notebooks/quark_data_colab.ipynb)
+  (*Runtime → CPU*, *Run all*). Collection is resumable: if the session ends, *Run all* again. Locally:
+  `uv run quark data collect mixes/chatbot-v1.yaml`, then `uv run quark data prepare-mix mixes/chatbot-v1.yaml`
+  (`quark data mix-status` shows progress).
+- **Train on it:** set `data.mix` (and the same `data.tokenizer`) in a model config or compare spec.
+  `data.weights` chooses how often each source is used, so domain weights can be compare arms without
+  re-preparing anything:
+
+  ```yaml
+  data:
+    mix: chatbot-v1
+    tokenizer: {type: train, size: 8192}
+    weights: {general: 0.70, education: 0.10, neurodivergence: 0.08, early_childhood: 0.07, children_stories: 0.05}
+  ```
+- **Validation per source:** each source has its own validation split; the dashboard and compare reports
+  show validation loss per source. The headline val loss is a fixed weighted mean (`data.eval_weights`,
+  equal by default), so it means the same thing whatever the training weights are.
+- **Repetition:** a source that would be seen more than ~4 times in a run triggers a warning.
+
+What exists for each domain, and why the recipe filters the way it does:
+[docs/domain_data_survey.md](docs/domain_data_survey.md).
+
 ## Compare components
 
 `quark compare` decides whether a component helps. A spec (see
@@ -131,6 +160,7 @@ quark components list [<slot>] | components show <slot:name>
 quark compare check <spec.yaml> | compare run <spec.yaml> --data <dir> | compare report <experiment dir>
 quark new <name> [--preset smoke|tinystories-small|ablation-s|ablation-m]
 quark data prepare [--source ...] [--subset ...] [--token-limit N] [--tokenizer train:8192|pretrained:smollm2] [--max-docs N]
+quark data collect <recipe.yaml> [--source NAME] | data prepare-mix <recipe.yaml> | data mix-status <recipe.yaml>
 quark train <model> --data <dir> | --resume latest|best|<path> [--max-steps N]
 quark generate <model> [--ckpt best|latest|<path>] [--prompt ...] [--samples N] [--temperature ...]
 ```
@@ -145,4 +175,6 @@ quark generate <model> [--ckpt best|latest|<path>] [--prompt ...] [--samples N] 
 - First add-ons done: Muon, WSD, QK-norm, z-loss, ALiBi, NoPE, ReLU² (`quark components list`).
 - `quark compare` (paired-seed ablations), the `ablation-s` / `ablation-m` ladder presets and the Colab compare
   notebook: done.
-- Next: data mixtures with per-domain validation, then the first experiments on the target mix.
+- Data mixtures (recipes, resumable CPU collection, per-source weights and validation, Colab data notebook):
+  done. First recipe: `mixes/chatbot-v1.yaml`.
+- Next: read the `first-batch` results; build the chatbot-v1 mix; domain-weight experiments on it.

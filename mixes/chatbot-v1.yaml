@@ -1,0 +1,74 @@
+# Data mix v1 for the chatbot target (plan §18, docs/domain_data_survey.md). Sized for the ablation ladder
+# (ablation-s / ablation-m); the target-size run will need a bigger collection.
+#
+#   quark data collect mixes/chatbot-v1.yaml       CPU only, resumable; ~3-5 h (one pass over FineWeb-Edu
+#                                                   feeds all four FineWeb sources; neurodivergence is the
+#                                                   rarest, so it decides how long the scan runs)
+#   quark data prepare-mix mixes/chatbot-v1.yaml   shared tokenizer + per-source token files
+# On Colab: notebooks/quark_data_colab.ipynb (a CPU runtime is enough).
+#
+# Training picks the weights (data.weights in the config or compare spec), not this file. A starting point:
+#   general 0.70, education 0.10, neurodivergence 0.08, early_childhood 0.07, children_stories 0.05
+# These are guesses to be tested: the domain weights are themselves a compare experiment.
+
+name: chatbot-v1
+tokenizer: {type: train, size: 8192}
+val_fraction: 0.005
+
+sources:
+  general:
+    note: General educational English, the base of the mix.
+    source: HuggingFaceFW/fineweb-edu
+    subset: sample-10BT
+    tokens: 300000000
+
+  education:
+    note: Teaching and learning (teacher-facing material); ~4.5% of FineWeb-Edu.
+    source: HuggingFaceFW/fineweb-edu
+    subset: sample-10BT
+    tokens: 60000000
+    filter: {domain: education}
+
+  early_childhood:
+    note: >-
+      Knowledge about early childhood: development, teaching young children, parenting (option b, decided
+      2026-10-10). ~0.86% of FineWeb-Edu, mostly adult-facing.
+    source: HuggingFaceFW/fineweb-edu
+    subset: sample-10BT
+    tokens: 25000000
+    filter: {domain: early_childhood}
+
+  neurodivergence:
+    note: >-
+      Neurodivergence, curated toward a neurodiversity-affirming perspective (decided 2026-10-10; children will
+      talk to the model). ~0.74% of FineWeb-Edu, mostly medical/parent-facing, so deficit- and cure-framed text
+      is left out. The lists below are a first pass for review, not a final word: excluding a phrase also drops
+      articles that quote it to argue against it.
+    source: HuggingFaceFW/fineweb-edu
+    subset: sample-10BT
+    tokens: 25000000
+    filter:
+      domain: neurodivergence
+      exclude_sites:
+        - autismspeaks.org     # criticized by autistic self-advocacy groups for cure/deficit framing
+        - ageofautism.com      # vaccine-autism misinformation
+        - generationrescue.org # vaccine-autism misinformation, "recovery" framing
+      exclude_patterns:
+        - '\bsuffer(?:s|ing|ed)? (?:from|with) (?:autism|adhd|dyslexia|asperger)'
+        - '\b(?:afflicted|stricken) (?:with|by) (?:autism|adhd)'
+        - '\bcur(?:e|es|ing|ed) (?:for |of )?(?:autism|adhd)'
+        - '\brecover(?:y|ed|ing)? from autism'
+        - '\bdefeat autism'
+        - '\bautism epidemic'
+        - '\bvaccines? (?:cause|causes|caused) autism'
+        - '\bchelation'
+
+  children_stories:
+    note: >-
+      Child-voiced synthetic stories (Cosmopedia, format story_children): simple, warm language for a model
+      children talk to. Formulaic, so keep its weight low.
+    source: HuggingFaceTB/cosmopedia
+    subset: stories
+    tokens: 30000000
+    filter:
+      columns: {format: [story_children]}

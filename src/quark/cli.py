@@ -1,7 +1,7 @@
 """`quark` command-line entry point.
 
-Available: version, gpu detect|list, components list|show, compare check|run|report, new, data prepare, train,
-generate. The rest of plan §13
+Available: version, gpu detect|list, components list|show, compare check|run|report, new,
+data prepare|collect|prepare-mix|mix-status, train, generate. The rest of plan §13
 (plan, build, notebook, compare, export, models) arrives in later phases.
 """
 
@@ -276,6 +276,72 @@ def data_prepare(
         f"Wrote {out}: vocab {meta['vocab_size']:,}, train {meta['train_tokens'] / 1e6:,.1f}M tokens "
         f"({meta['train_docs']:,} docs), val {meta['val_tokens'] / 1e6:,.2f}M tokens ({meta['val_docs']:,} docs)"
     )
+
+
+def _load_recipe(recipe: Path):
+    from pydantic import ValidationError
+
+    from quark.data.mix import MixRecipe
+
+    try:
+        return MixRecipe.from_yaml(recipe)
+    except (OSError, ValidationError, ValueError) as err:
+        console.print(f"[red]{recipe}: {err}[/red]")
+        raise typer.Exit(1) from err
+
+
+def _print_mix_status(r, root: Path) -> None:
+    from quark.data.mix import collect_status
+
+    table = Table(title=f"mix {r.name}: collection")
+    for column in ("source", "kept", "target", "status"):
+        table.add_column(column)
+    for name, st in collect_status(r, root).items():
+        table.add_row(name, f"{st['tokens'] / 1e6:,.1f}M", f"{st['target'] / 1e6:,.0f}M",
+                      "[green]done[/green]" if st["done"] else "collecting")
+    console.print(table)
+
+
+@data_app.command("collect")
+def data_collect(
+    recipe: Path = typer.Argument(..., help="Mix recipe (YAML), e.g. mixes/chatbot-v1.yaml."),
+    root: Path = typer.Option(Path("data"), help="Data root; the mix goes to <root>/mix-<name>-<tokenizer>/."),
+    source: list[str] | None = typer.Option(None, "--source", help="Only these sources (repeatable)."),
+) -> None:
+    """Stream and filter a mix's sources into cached text (CPU only; resumes where it stopped)."""
+    from quark.data.mix import collect
+
+    r = _load_recipe(recipe)
+    collect(r, root, only=source or None, log=console.print)
+    _print_mix_status(r, root)
+
+
+@data_app.command("prepare-mix")
+def data_prepare_mix(
+    recipe: Path = typer.Argument(..., help="Mix recipe (YAML)."),
+    root: Path = typer.Option(Path("data"), help="Data root (as for collect)."),
+) -> None:
+    """Train the mix's tokenizer and tokenize every collected source."""
+    from quark.data.mix import prepare_mix
+
+    r = _load_recipe(recipe)
+    try:
+        meta = prepare_mix(r, root, progress=lambda name, d, t: d % 100_000 == 0 and console.print(f"  {name}: {d:,} docs"))
+    except RuntimeError as err:
+        console.print(f"[red]{err}[/red]")
+        raise typer.Exit(1) from err
+    for name, src in meta["sources"].items():
+        console.print(f"{name}: train {src['train_tokens'] / 1e6:,.1f}M tokens ({src['train_docs']:,} docs), "
+                      f"val {src['val_tokens'] / 1e6:,.2f}M")
+
+
+@data_app.command("mix-status")
+def data_mix_status(
+    recipe: Path = typer.Argument(..., help="Mix recipe (YAML)."),
+    root: Path = typer.Option(Path("data"), help="Data root (as for collect)."),
+) -> None:
+    """Show how far a mix's collection has got."""
+    _print_mix_status(_load_recipe(recipe), root)
 
 
 @app.command()

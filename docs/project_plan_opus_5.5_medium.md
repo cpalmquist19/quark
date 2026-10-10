@@ -505,7 +505,7 @@ Optimizer implementations (Muon, etc.) are vendored as small, readable files wit
 - Still to add: DaRoPE, grad checkpointing, 8-bit AdamW.
 - ✅ Per-component contract tests (shapes, causality, KV cache, overfit, param count) for every registered component.
 - ✅ (2026-10-10) `quark compare`: baseline + arms × **paired seeds** (≥2–3), equal token budget, report with paired deltas, speed and an equal-time estimate. At this scale seed noise is the same size as many of the effects (E2 measured gains of 0.005–0.02 nats). Ablation ladder presets `ablation-s` (8.5M, 40M tokens) and `ablation-m` (38M, 200M tokens) at seq_len 2048 (§18.2). Runs seed by seed, skips finished runs, resumes unfinished ones and respects the Colab session limit; `notebooks/quark_compare_colab.ipynb` runs it on Colab. Spec format: `experiments/first-batch.yaml`.
-- **Data mixtures** (added for §18): several sources with weights and filters (audience, topic, keyword), a validation split per source, and per-domain val loss in the trainer, plots and compare reports.
+- ✅ (2026-10-10) **Data mixtures** (added for §18): recipes (`mixes/*.yaml`) of streamed sources with filters (domain keyword density, dataset columns, excluded sites/patterns); resumable CPU collection that fills every source sharing a stream in one pass; a shared tokenizer; training weights in `data.weights` (compare arms, no re-preparation); per-source validation and epoch warnings; per-source deltas in compare reports; `notebooks/quark_data_colab.ipynb` (CPU runtime). First recipe: `mixes/chatbot-v1.yaml`.
 - First experiments on the target mix: domain weights, then the component arms.
 
 **Phase 2b: Parameter-efficiency stack (the project's north star)**
@@ -590,7 +590,8 @@ The models Phase 2b selects components for are aimed at this target. TinyStories
 | Use | A **chatbot**: pretraining, then chat fine-tuning (SFT, Phase 2c) |
 | Size | **~125–350M params**, final training on a **paid GPU** (Colab Pro / rented L4 or A100). Ablations still run on the free T4 |
 | Context | **2048 tokens** (multi-turn chat); YaRN (Phase 5) can extend it later |
-| Data | **FineWeb-Edu as the general-English base**, with three domains upweighted beyond their natural share: **neurodivergence** (autism, ADHD, dyslexia, executive function, sensory processing, special education), **education** (teaching, learning, pedagogy) and **pre-K / kindergarten-level knowledge and language** |
+| Data | **FineWeb-Edu as the general-English base**, with three domains upweighted beyond their natural share: **neurodivergence** (autism, ADHD, dyslexia, executive function, sensory processing, special education), **education** (teaching, learning, pedagogy) and **early childhood** |
+| Domain decisions (2026-10-10) | **Early childhood = knowledge *about* early childhood** (development, teaching young children, parenting) from filtered web text; no paid synthetic generation. **Neurodivergence = neurodiversity-affirming**, and **children will talk to the model**: the neurodivergence slice is curated (deficit/cure framing left out), and child safety shapes the data and SFT (Phase 2c) |
 | Tokenizer | Open. The §7.4 rule points to SmolLM2's 49k tokenizer at this size; a custom ~32k BPE trained on the mix may fit child-level and domain vocabulary better. Decide with a test at the ~40M rung |
 
 ### 18.1 Data sources (first survey, 2026-10-10)
