@@ -152,7 +152,7 @@ A new component therefore needs only its own specific tests. The generic contrac
 - `quark components list|show`;
 - the contract test harness.
 
-**Out (next steps, to discuss):** the actual add-ons (GQA as a planner dimension, QK-norm, ALiBi/NoPE, DaRoPE, ReLU², WSD, Muon, z-loss, grad checkpointing, 8-bit AdamW), `quark compare`, and the attention-bias hook for ALiBi. That hook gets added to `PositionEncoding` together with its first user, so it's tested from day one.
+**Out (next steps at the time; see §9 for what has been added since):** the actual add-ons (GQA as a planner dimension, QK-norm, ALiBi/NoPE, DaRoPE, ReLU², WSD, Muon, z-loss, grad checkpointing, 8-bit AdamW), `quark compare`, and the attention-bias hook for ALiBi. That hook gets added to `PositionEncoding` together with its first user, so it's tested from day one.
 
 ## 9. First add-ons (2026-10-10)
 

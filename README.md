@@ -1,12 +1,16 @@
 # Quark
 
 A composable small-transformer workbench. Start from a baseline GPT, add techniques from recent papers, let a
-planner pick the best valid configuration for your GPU and goal, then train it locally or on Google Colab.
+planner pick the best valid configuration for your GPU and goal, then train it on Google Colab (or locally).
 
-- Plan: [docs/project_plan_opus_5.5_medium.md](docs/project_plan_opus_5.5_medium.md)
+- Plan and roadmap: [docs/project_plan_opus_5.5_medium.md](docs/project_plan_opus_5.5_medium.md)
+- Component registry design: [docs/component_registry.md](docs/component_registry.md)
 - Research notes: [docs/ml_papers3.txt](docs/ml_papers3.txt)
 
-## Setup (Windows, local GPU)
+Training currently runs on **Colab (free T4)**; the local machine is used for development, tests and short
+smoke runs.
+
+## Setup (Windows, for development)
 
 Requires [uv](https://docs.astral.sh/uv/). This creates `.venv/` with the CUDA build of PyTorch:
 
@@ -34,16 +38,61 @@ uv run quark generate ts-small --prompt "Once upon a time" --samples 3
 - Settings live in `models/<name>/config.yaml`. Resuming with a changed config is refused unless you pass
   `--allow-config-change`. Logging, eval, checkpoint and early-stopping settings can change freely.
 
-## Train in a notebook
+## Train on Google Colab
 
-- **Local:** open [notebooks/quark_local.ipynb](notebooks/quark_local.ipynb), select the `.venv` kernel, edit the
-  Settings cell, Run All.
-- **Google Colab (free T4):** upload [notebooks/quark_colab.ipynb](notebooks/quark_colab.ipynb) to Colab (or open
-  it from GitHub), set the runtime to T4 GPU, Run All. It installs Quark from GitHub and keeps data and
-  checkpoints on Google Drive. After a disconnect, Run All again and it resumes.
+1. Upload [notebooks/quark_colab.ipynb](notebooks/quark_colab.ipynb) to Colab (or open it from GitHub).
+2. *Runtime → Change runtime type → T4 GPU*.
+3. Edit the **Settings** cell: `MODEL_NAME` (a folder under `MyDrive/quark/models/`), `PRESET` (used only when
+   that folder doesn't exist yet), `RESUME`, `MAX_STEPS`.
+4. *Runtime → Run all*. Approve Google Drive access.
 
-Both notebooks show a live training dashboard. They're generated from one template by
+Things to know:
+
+- **Colab installs Quark from GitHub** (`QUARK_REF = "main"`). Local changes reach Colab only after they're
+  pushed. Set `QUARK_REF` to a commit or tag to pin a version.
+- **Everything persistent lives on Drive** under `MyDrive/quark/`: tokenized data (`data/`, prepared once and
+  reused) and models (`models/<name>/config.yaml` and `runs/<timestamp>/`). `latest.pt` is saved every 15
+  minutes.
+- **Resuming:** after a disconnect, *Run all* again. With `RESUME = "auto"` it continues the newest run of
+  `MODEL_NAME`. If that run already finished there is nothing left to train, so use a new `MODEL_NAME` (or
+  `RESUME = "new"`) for a fresh run.
+- **Always run from the top.** If Colab restarts the session (for example after the install), variables from
+  earlier cells are gone; an error like `name 'hw' is not defined` means an earlier cell didn't run.
+- **Changing the model's components on Colab:** edit `MyDrive/quark/models/<name>/config.yaml` (Colab's file
+  browser can open it) before training starts. See [Choose components](#choose-components).
+- **Getting a model back to this machine:** download the run folder from Drive and keep the layout:
+  `models/<name>/config.yaml` and `models/<name>/runs/<timestamp>/` with `best.pt` and `tokenizer.json`
+  (`latest.pt` only if you'll continue training). Then `uv run quark generate <name>`.
+
+The local notebook, [notebooks/quark_local.ipynb](notebooks/quark_local.ipynb), works the same way on this
+machine's GPU (select the `.venv` kernel). Both notebooks are generated from one template by
 `notebooks/build_notebooks.py`, so edit that and re-run it rather than editing the `.ipynb` files.
+
+## Choose components
+
+A model is built from **slots** (one choice each) and **toggles** (independent add-ons). List what's available:
+
+```powershell
+uv run quark components list            # everything, grouped by slot
+uv run quark components show optimizer:muon
+```
+
+Pick them in the model's `config.yaml`:
+
+```yaml
+model:
+  slots: {position: rope, attention: mha, norm: rmsnorm, mlp: swiglu, block: standard, head: tied}
+  toggles: {qk_norm: true, z_loss: {coef: 1.0e-4}}
+  params: {position: {base: 10000}}       # per-slot settings; omitted = paper defaults
+train:
+  optimizer: muon                         # adamw | muon
+  schedule: wsd                           # cosine | wsd
+  params: {schedule: {decay_frac: 0.2}}
+```
+
+Invalid combinations fail before training starts, with the reason (for example
+`unknown position 'ropee'; did you mean 'rope'?` or `requires attention:mha`). Grouped-query attention is
+`model.n_kv_heads`, not a component.
 
 ## Commands
 

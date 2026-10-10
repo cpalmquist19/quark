@@ -34,6 +34,8 @@ A composable transformer workbench: start with a baseline GPT, bolt on technique
 
 This drives many of the constraint rules, so it's worth stating up front.
 
+Since 2026-10-10 training runs on Colab only; the laptop is for development and short smoke tests.
+
 | | RTX 3070 Ti **Laptop** (local) | Colab Free (almost always a **T4**) |
 |---|---|---|
 | VRAM | 8 GB | ~15 GB usable |
@@ -96,8 +98,9 @@ quark/
 ├── README.md
 ├── src/quark/
 │   ├── config/            # Config schema (ModelConfig, TrainConfig, DataConfig, HardwareProfile)
-│   ├── components/        # The registry. One file per technique.
-│   │   ├── registry.py    # @register decorator, Component base class, slot definitions
+│   ├── components/        # The registry. One file per technique (as built: docs/component_registry.md).
+│   │   ├── registry.py    # @register, Component metadata, slots; base.py = slot interfaces; check.py = validation
+│   │   ├── toggles/       # qk_norm.py, z_loss.py, ... (metadata; implemented by a slot's component)
 │   │   ├── position/      # rope.py, nope.py, alibi.py, yarn.py, ...
 │   │   ├── attention/     # mha.py, gqa.py, mla.py, sliding_window.py, diff_attn.py, ...
 │   │   ├── norm/          # layernorm.py, rmsnorm.py, qk_norm.py, layerrope.py
@@ -365,7 +368,7 @@ Writes `models/tiny-story-v1/`:
 
 Built with `nbformat` + Jinja templates from **one template with target-specific blocks**, so local and Colab never drift apart. Both notebooks call the same `quark` trainer.
 
-**How the code gets into Colab**: the notebook embeds the frozen `model.py` and a pinned trainer via `%%writefile` cells, making it fully self-contained when you upload just the `.ipynb`. An alternative mode, `pip install git+<your repo>@<commit>`, is available once the repo is on GitHub.
+**How the code gets into Colab**: the Phase 1 notebooks `pip install git+<repo>@<QUARK_REF>` (default `main`). Code reaches Colab only once it's pushed, and a disconnected run reinstalls on resume, so pushed changes must keep `config_hash()` and checkpoint keys stable (pinned by tests). The planned self-contained mode (frozen `model.py` + pinned trainer embedded via `%%writefile`) arrives with the generator in Phase 4.
 
 ### Cell order
 
@@ -451,14 +454,14 @@ Every N steps:
 
 ```
 quark gpu detect | list | bench
-quark components list [--slot attention] | show muon
+quark components list [<slot>] | show <slot:name>
 quark plan --gpu <profile> --purpose <profile> [--hours H] [--weights ...] [--top K] [--verify] [--explain]
 quark build <plan-row|config.yaml> --name <model>
 quark data prepare --source <hf-name|path> --tokenizer <name|train:8k> --out data/<name>
 quark notebook models/<name> --target local|colab|both
 quark train models/<name> [--data data/<name>] [--resume latest]
 quark generate models/<name> --prompt "..."
-quark compare <run> <run> ...
+quark compare <spec.yaml>        # baseline + arms x paired seeds (Phase 2)
 quark export models/<name> --format hf
 quark models list | show <name>
 ```
@@ -562,5 +565,5 @@ Each step is ablated against the previous best at the same token budget, startin
 3. ~~**Tokenizer preference**~~ **Resolved:** custom ~8k BPE by default, SmolLM2 tokenizer for larger / broad-data / KD models. The planner picks per model; see "Tokenizer rule" in §7.4.
 4. ~~**Experiment tracking**~~ **Decided (default):** local `metrics.jsonl` + PNG plots, mirrored to Drive on Colab. W&B is an optional toggle added in Phase 6. No account or API key is needed to start.
 5. ~~**Local environment**~~ **Decided (default):** native Windows. Every recommended component is pure PyTorch + SDPA, and WSL2 currently has no Linux distro installed (only `docker-desktop`). Revisit only for Gated-DeltaNet hybrids (F2). **Setup blocker found 2026-10-09:** the installed PyTorch is `2.13.0+cpu`, which can't see the GPU (RTX 3070 Ti Laptop, 8 GB, driver 595.79). Phase 0 must create a project venv with a CUDA build of PyTorch and verify `torch.cuda.is_available()`.
-6. ~~**Repo hosting**~~ **Decided (default):** `git init` locally in Phase 0, with an optional *private* GitHub repo (`gh` is installed). Notebooks stay **self-contained** (code embedded via `%%writefile`), so Colab never needs GitHub credentials.
+6. ~~**Repo hosting**~~ **Decided (default):** `git init` locally in Phase 0, with an optional *private* GitHub repo (`gh` is installed). Notebooks stay **self-contained** (code embedded via `%%writefile`), so Colab never needs GitHub credentials. **As built (2026-10-10):** the repo is on GitHub (`cpalmquist19/quark`) and the Phase 1 notebooks install from it; the `%%writefile` mode comes with Phase 4 (see §10).
 7. ~~**Eval interface**~~ **Finding:** the eval project (`C:\Code\ai-agent\evals`) scores *agentic tool use* of chat models through LM Studio / OpenAI-compatible APIs. A from-scratch 10–150M base model can't do tool calling, and LM Studio's llama.cpp can't load our custom architectures (Hyperloop, LayerRoPE, …), so that harness isn't a fit for Quark models. **Decision:** Quark gets its own lightweight evals: validation loss/perplexity, plus a few small-model benchmarks (e.g. BLiMP, HellaSwag, ARC-Easy, LAMBADA) via a `loglikelihood(text)` API. An OpenAI-compatible `quark serve` endpoint stays a "later" item, if a Quark model is ever instruction-tuned.
