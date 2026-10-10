@@ -1,0 +1,16 @@
+# Google Colab free tier (almost always a Tesla T4). fp16 + GradScaler; no bf16/TF32/FlashAttention-2.
+name: colab-t4
+gpu_name: Tesla T4
+vram_gb: 15.0
+usable_vram_gb: 14.0
+compute_capability: "7.5"
+bf16: false                  # emulated and slow on Turing, so treated as unsupported
+tf32: false
+flash_attn_pkg: false
+sdpa_kernels: [mem_efficient, math]
+triton: true
+session:
+  max_hours: 12
+  weekly_hours: 30
+  checkpoint_every_min: 15
+storage: gdrive

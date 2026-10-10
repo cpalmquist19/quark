@@ -1,0 +1,18 @@
+Help me plan this project idea:
+
+I want to be able to start with a basic transformer model.
+I want to be able to addon specific methods, tactics, architectural changes, etc. that are laid out in various ML papers I have seen on X and Arxiv. Things such as DaRope, YaRN, MTP, looping transformers, different attention mechanisms, different schedules and optimizers, like muon vs adamw, wsd, etc.
+I want to have a way to provide the available GPU card, mine is an RTX 3070 TI w/8GB for example. I also have access to a 15gb card via Google Free Collab for 30 hours per week. So, given a GPU, what transformer model, with addons, would be the best configuration for the card and purpose of the model.
+I know that AI has advised not every feature or method can be used or should be used in all circumstances so that information should be included in the calculations.
+I would like to know only valid configurations and having a ranking of what model is best, which is determined by a number of things, which the user can configure.
+Model options for ranking could include memory usage, number of params, time to train, etc.
+Once a model has been selected, it should be built/created/coded and stored somewhere in the project so the user can refer to it and use as needed.
+The model should be able to be selected, given a data source, and then be able to train it or run inference on it.
+The script should generate a notebook file the user can run locally or upload to Google Collab and run.
+The steps of the notebook should be in the proper order for loading the model, loading the data, and training the data on Google Collab and/or locally.
+If required, two notebooks should be generated, one for local and one for Google Collab.
+During training, I want to see the standard stats, w/e those are.
+I see training graphs of the model loss going down on X often, that type of thing should be displayed.
+The training should save best checkpoints and stop if overfitting starts to save on wasted compute time.
+Training should be able to load a saved checkpoint and resume training.
+Evals can come in a future pass, I have an eval project I am working on concurrently with this one.

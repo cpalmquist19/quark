@@ -1,0 +1,12 @@
+# RTX 3070 Ti Laptop GPU on native Windows (plan §2). Run `quark gpu detect` for live values.
+name: rtx3070ti-laptop
+gpu_name: NVIDIA GeForce RTX 3070 Ti Laptop GPU
+vram_gb: 8.0
+usable_vram_gb: 7.2          # headroom for CUDA context + fragmentation
+compute_capability: "8.6"
+bf16: true
+tf32: true
+flash_attn_pkg: false        # not on native Windows; possible under WSL2
+sdpa_kernels: [mem_efficient, math]   # official Windows torch wheels aren't built with flash SDPA (probed 2026-10-09)
+triton: false                # optional via triton-windows
+storage: local

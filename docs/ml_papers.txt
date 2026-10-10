@@ -1,0 +1,34 @@
+Positional / RoPE improvementsDaRoPE (Data-aware RoPE) — arXiv 2609.34556 (28 Sep 2026). Keeps standard RoPE on fast frequency bands but replaces slow bands with bounded, data-dependent coordinates learned from context. Reduces recency bias and improves non-text + language modeling / extrapolation. Directly addresses a known RoPE weakness.
+  Paper: "RoPE is Dead, Long Live RoPE: Towards Scalable Data-aware Positional Encodings" (Lévy, Videau, Yehya, King, d'Ascoli, Moreau) — https://arxiv.org/abs/2609.34556
+
+MoE variants suited to small modelsFoil / Looped MoE — arXiv 2609.35751 (28 Sep). “Flatten the experts, untie the attention.” Makes looped MoE work better by increasing experts-per-layer + number of passes while sharing experts/routers. Better expert utilization at fixed active compute/params. Relevant if you want parameter efficiency without huge active FLOPs.
+  Paper: "How to Loop MoE: Flatten the Experts, Untie the Attention" (Wang et al.) — https://arxiv.org/abs/2609.35751
+MoSE (Mixture of Slimmable Experts) — ICML 2026. Each expert is itself width-slimmable, so you can trade accuracy vs. compute more continuously at inference.
+  Paper: "MoSE: Mixture of Slimmable Experts for Efficient and Adaptive Language Models" (Tastan, Laskaridis, Nandakumar, Horváth) — https://arxiv.org/abs/2602.06154
+  (Not the unrelated embodied-robotics "MoSE", arXiv 2507.07818.)
+Extreme sparsity examples: Sigma-MoE-Tiny style (very high total/active ratio, fine-grained experts, only 1 expert active).
+  Paper: "Sigma-MoE-Tiny Technical Report" (Microsoft) — https://arxiv.org/abs/2512.16248 (~20B total / ~0.5B active, 96 experts per layer, top-1)
+Other MoE notes: head-wise routing (MH-MoE) to reduce catastrophic forgetting; ZipMoE for efficient on-device serving; scaling-law papers clarifying active vs. total parameters.
+  MH-MoE: "Multi-Head Attention as a Source of Catastrophic Forgetting in MoE Transformers" (ICML 2026) — https://arxiv.org/abs/2602.12587
+    (Not the 2024 "Multi-Head Mixture-of-Experts" paper, which only shares the name.)
+  ZipMoE: "ZipMoE: Efficient On-Device MoE Serving via Lossless Compression and Cache-Affinity Scheduling" (ICML 2026) — https://arxiv.org/abs/2601.21198
+  Scaling laws (two candidates, unclear which was meant):
+    Holistic MoE scaling laws (compute/token + active + total params) — https://arxiv.org/abs/2603.21862
+    "Towards Greater Leverage: Scaling Laws for Efficient Mixture-of-Experts Language Models" (Ling team, ICLR 2026) — https://arxiv.org/abs/2507.17702
+
+Other architectural tricksLooped / recurrent transformers — Strong X discussion (e.g., Aleksa Gordić, mid-Sep). Reuse a block of layers multiple times (prelude → recurring core looped r times → coda). Adds a new scaling axis (recurrent depth / latent compute) without growing parameters or verbal CoT length. Training samples variable r; supports early exit, KV reuse, and speculative decoding. Complements MoE nicely.
+  No single paper (X thread not found). Relevant papers:
+    Geiping et al. 2025, "Scaling up Test-Time Compute with Latent Reasoning: A Recurrent Depth Approach" (Huginn; origin of prelude/core/coda) — from memory, not verified in this search
+    WaveFront Decoding: self-speculative decoding for looped LMs — https://arxiv.org/abs/2609.23033
+    River-LLM: early exit with KV sharing — https://arxiv.org/abs/2604.18396
+    Depth-adaptive inference of looped LMs via continuous depth batching — https://arxiv.org/abs/2608.09444
+    "How Much Is One Recurrence Worth? Iso-Depth Scaling Laws for Looped Language Models" — https://arxiv.org/abs/2604.21106
+Self-Pruning Transformer / Universal Attention — Extreme KV-cache compression while keeping RoPE + softmax expressivity. Achieves large compression ratios with better downstream performance.
+  Paper: "A Self-Pruning Transformer: Extreme KV Cache Compression with Universal Attention" (Phil. Trans. R. Soc. A; no arXiv ID found) — https://research.ibm.com/publications/a-self-pruning-transformer-extreme-kv-cache-compression-with-universal-attention
+Sparse attention variants (cross-head unified sparse attention for long-horizon reasoning) and dynamic sparsity / unstructured sparsity in FFNs (with good CUDA kernels).
+  Cross-head sparse attention: "Less Is More: Training-Free Sparse Attention with Global Locality for Efficient Reasoning" / ICML 2026 title "Less Is More: Fast and Accurate Reasoning with Cross-Head Unified Sparse Attention" — https://arxiv.org/abs/2508.07101
+  FFN sparsity: "Sparser, Faster, Lighter Transformer Language Models" (Sakana AI + NVIDIA, ICML 2026) — https://arxiv.org/abs/2603.23198
+Hybrid NoPE ideas (local layers create natural recency bias so global layers can drop explicit position encodings).
+  Paper: Dawes, Alonso, Figliolia, Millidge — https://arxiv.org/abs/2609.38109 (SWA / gated linear attention induce recency bias that global NoPE heads select)
+  Related: "Modern Transformers Are Implicit Hybrids" — https://arxiv.org/abs/2609.02986
+

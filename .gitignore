@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/
+
+# Data and training outputs (large, regenerable)
+data/
+models/*/runs/
+*.pt
+*.bin
+*.safetensors
+
+# Machine-specific hardware profiles written by `quark gpu detect --save`
+hardware/local-*.yaml
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

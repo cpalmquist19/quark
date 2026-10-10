@@ -1,0 +1,370 @@
+ML PAPERS 2 - arXiv sweep, 2026-09-18 to 2026-10-09
+====================================================
+
+Companion to ml_papers.txt. Same target as the DaRoPE report: Quark, 10-100M param decoder-only LMs,
+context 512-2048, RTX 3070 Ti 8 GB (bf16, native Windows, SDPA only) and Colab T4 15 GB (fp16 +
+GradScaler, no bf16, no FlashAttention), no custom CUDA.
+
+How this list was made
+- Queried the arXiv API for submissions in the window across: optimizers (Muon etc.), LR schedules,
+  looped/recurrent depth, MTP, positional encodings, attention variants, stability/low precision,
+  small-model pretraining, scaling laws/data repetition, hyperparameter transfer, memory-efficient training.
+- Read the HTML full text of 26 candidates (method, model sizes, token budgets, hardware, seeds, numbers).
+- 10 kept (below). 16 were killed or not selected, each with the reason (last section).
+- Caveat on the reading: each page was read through a summarizer, and most pages were cut off at
+  ~100k characters, so appendices (hardware, hyperparameters, code links) were often not seen.
+  "Code not confirmed" below means "no link seen", not "no code exists". Numbers are as reported by
+  the authors; almost all are single-paper, few-seed, and none are from our hardware.
+- VERIFIED 2026-10-09: all 10 kept papers re-checked against the arXiv API (title/authors/dates) and
+  the FULL HTML text (tables included, no summarizer). All exist and the core claims hold. Errors found
+  were corrected in place and marked "[corrected]".
+- Everything here is weaker evidence than a result on our own runs. Treat each as a candidate for the
+  registry (maturity: promising/experimental), not as established.
+
+Priority key: [A] build/adopt soon, [B] worth an ablation, [C] low-cost option / planner guidance.
+
+
+======================================================================
+A. ATTENTION
+======================================================================
+
+1. [A] Gated values + sink logit ("Abstention and Noise Filtering: Two Missing Primitives of Softmax Attention")
+   arXiv 2609.22005 (v1 2026-09-18, v2 later) - Richard Zhe Wang - https://arxiv.org/abs/2609.22005
+   What: two tiny additions to softmax attention.
+     - sink logit: a learnable per-head scalar adds a phantom key (zero value) to the softmax denominator,
+       so a head can "abstain".
+     - value gate: a scalar in (0,1) per value read, sigmoid of a learned linear function of the value
+       ("projection gate") or of its norm vs a learned threshold ("norm gate"), applied before mixing.
+     - best variant: sink + projection gate. Extra params per layer: sink = H, proj gate = H(d+1),
+       sink+proj = H(d+2) (H heads, d head dim). KV cache unchanged.
+   Evidence at our scale: this is the closest scale match of any paper in this list.
+     10M (6L, d384, ctx 512, 0.20B tok), 50M (10L, d640, ctx 1024, 0.95B tok), 124M, 350M.
+     FineWeb-Edu, GPT-2 tokenizer, AdamW, bf16, ONE consumer GPU (RTX 5090), 3 paired seeds.
+     Val-loss gain over baseline (nats), sink+proj: 0.022 (10M), 0.013 (50M), 0.011 (124M), 0.019 (350M).
+     Sink alone: 0.019 / 0.007 / 0.005 / 0.010. Gains are small (~0.3-0.5% of loss) but consistent across
+     tiers; zero-shot differences at 124M are within seed noise.
+   Fit for Quark: attention-slot toggle ("attn:sink", "attn:vgate"). Cheap, no kernels.
+     Value gate only needs V, so it can be applied before F.scaled_dot_product_attention (my inference;
+     the paper does not describe this path). Sink can be done with an extra constant coordinate on q/k
+     (paper pads head_dim to a multiple of 8 for fused kernels).
+   Watch for:
+     - fp16/T4 untested (gate math done in fp32 in the paper). Keep gates in fp32 on T4.
+     - With RoPE/DaRoPE, add the phantom coordinate AFTER rotation (my inference - check).
+     - Gate/sink params are tiny vectors: AdamW group, no weight decay on thresholds/sink (paper excludes
+       the norm-gate threshold from decay). Keep out of Muon.
+     - Norm gate got WORSE than baseline under heavy injected noise (at 124M already at dose 0.8:
+       +4.40 vs +2.63 nats; and at 1.6) - prefer projection gate. [corrected]
+     - 350M sink-logit seed spread is large; code release not confirmed.
+
+
+======================================================================
+B. NORMALIZATION / BLOCK DESIGN
+======================================================================
+
+2. [B] LayerRoPE (depth-wise rotary modulation of RMSNorm gains)
+   arXiv 2610.09179 (2026-10-06) - Shikhar Srivastava, Christopher Kanan - https://arxiv.org/abs/2610.09179
+   What: replace the per-layer RMSNorm weight vectors with ONE shared gain per norm site, multiplied by a
+     depth-dependent complex factor c(l,j) = exp(r(l)) * exp(i*theta(l,j)), with r and theta functions of
+     log(l+1) (4 sites: attn in/out, MLP in/out). About 4d+16 params instead of 2*L*d. No matmuls;
+     paper estimates <0.02% training FLOPs overhead.
+   Evidence: ladder 58M / 134M / 250M / 554M / 1.34B on C4 (seq len 256, LLaMA-2 tokenizer, ~4x Chinchilla).
+     134M, 3 seeds at each method's tuned LR: 2.831 vs 2.915 for Pre-Norm (paired -0.085 +- 0.014;
+     seed std <= 0.016; LayerRoPE lowest under every seed). (The often-quoted 3.0317 vs 3.1003 is a
+     single-run ablation table, not the seeded result.) [corrected]
+     Also tried inside a looped model (Parcae 140M): val PPL 18.66 -> 18.36. LR sensitivity reportedly
+     3-10x lower. Optimal LR vs Pre-Norm: 4x (58M), 5x (368M), 2x (1.3B); vs Peri-Norm 1-2x. [corrected]
+   Fit for Quark: new "norm" slot component ("norm:layerrope"). Elementwise only, SDPA-agnostic.
+     Interesting for the looped block (Phase 5): gains are a function of depth, so loop iterations can
+     get distinct gains for free.
+   Watch for:
+     - Only seq len 256 tested; nothing at 512-2048. Hardware not stated.
+     - At 1B the authors had to move logits to fp32 under bf16 because output-logit scale grew.
+       On the T4 (fp16, narrower range) keep logits fp32, monitor logit magnitude, keep z-loss available.
+     - The paper is internally inconsistent about the scalar count (4 pairs vs 16 scalars) and init;
+       implement from the equations, then unit-test that init reproduces plain RMSNorm.
+     - Raised optimal LR means the planner must NOT reuse the RMSNorm LR prior.
+
+3. [B] Towards Looped Models Done Right, Part II: Rethinking at Fixed Points
+   arXiv 2610.06833 (2026-10-05) - Benhao Huang, Chufan Shi, Junlin Chen, et al.
+   https://arxiv.org/abs/2610.06833   Code listed: github.com/ifm-ai/xllm-loop (contents not verified)
+   What (for the Phase-5 looped block, prelude / recurrent core / coda):
+     - Orthogonal input injection (OrthoInj): re-inject the prelude output q each iteration as
+       zeta = Q_q * Lambda * h + q, with Q_q = I - q q^T / (||q||^2 + eps), i.e. remove from the carried
+       state the component along the injected input. A few lines; no extra kernels.
+     - Truncated BPTT through only the last 2 recurrences: memory/compute scale with the window, not the
+       loop count. With b=2, extrapolating to more loops / terminal KV sharing cost <= 2% / 3% PPL
+       (vs >25% / 21% with full BPTT at fixed R=5); b >= 4 matches full BPTT within 1% at 400M. [corrected]
+     - Learned depth prior over training loop counts (policy-gradient style, +<=1.6% FLOPs).
+   Evidence: 100M / 400M / 1.6B, 1 + 2R + 1 Llama-style layout. MixVal (held-out) PPL, learned prior vs
+     fixed Poisson-lognormal prior: 5.67 vs 5.73 (100M), 3.93 vs 4.00 (400M); WikiText PPL 19.91 vs 20.19
+     (100M), 12.28 vs 12.55 (400M). OrthoInj vs Parcae-decay (MixVal): 5.67 vs 5.75 (100M), 3.94 vs 3.96
+     (400M). One seed per config. [corrected: the 5.67/5.73 numbers are MixVal, not WikiText]
+   Fit for Quark: borrow OrthoInj + truncated BPTT as options of "block:looped". Skip the RL / distillation /
+     KV-sharing parts (serving-side, or need large teachers).
+   Watch for:
+     - Smallest run is 100M on 21.5B tokens (~215 tok/param). That is ~15 days on a 3070 Ti by my
+       estimate, so the RECIPE is out of budget; only the mechanisms transfer.
+     - [corrected] There is NO MixVal/WikiText disagreement: the learned prior improves both. The column
+       previously read as "MixVal" is training FLOPs (learned prior costs ~0.5% more).
+     - Gains are small and single-seed; mark "experimental".
+   Related, killed: "Closing the Loop" (2610.00673, >=1.4B, 64 GPUs) - see section F.
+
+
+======================================================================
+C. HEAD / MTP
+======================================================================
+
+4. [C] LightMTP: Lightweight Latent Multi-Token Prediction
+   arXiv 2610.06031 (2026-10-05) - Tamara Czinczoll, Julie Kallini, Gerard de Melo, Chen Shani
+   https://arxiv.org/abs/2610.06031
+   What: MTP whose future-token targets are the model's OWN intermediate hidden states (stop-grad, from
+     ~2/3 depth) at future positions, predicted by a small 2-layer GELU MLP head with a cosine loss.
+     No extra vocabulary projection, no extra logits. Head is discarded after training (no inference
+     change). +0.3% (single-offset) to +0.9% (multi-offset) params at 24 layers.
+   Why it matters for Quark: the plan's MTP is penalized at small scale and standard MTP heads add
+     vocab-sized logits (a known 8 GB problem). This is the only MTP variant seen that adds almost no
+     memory, and it did NOT cost LM quality in the paper.
+   Evidence: FineWeb-Edu, nanochat recipe (12x scaling params in tokens). Main runs 24-layer ~1.4-1.5B;
+     appendix has 12-layer ~286M. Byte-level PPL 1.683 vs 1.683 for NTP (no loss); CORE avg 40.30 vs
+     40.43 (flat); gains only on Countdown (46.4 -> 56.7%) and MBPP-finetuned pass@10 (15.2 -> 23.3;
+     MBPP runs use a separate model pretrained with 10% Python in the mix).
+     Gloeckle-style and DeepSeek-style MTP baselines (the authors' reimplementations) were worse on LM.
+   Fit for Quark: "head:mtp_latent". Treat as a regularizer/auxiliary objective, not a quality win.
+   Watch for:
+     - Smallest model is d12: 286M total but only 110M non-embedding ("scaling") params, so ~1-10x our
+       size, not 3-30x. [corrected] The paper does NOT say the effect is unclear below 3B; it argues
+       LightMTP is useful at <3B where earlier MTP hurt. Still untested at 10-100M; keep the "scale" soft rule.
+     - bf16 autocast with fp32 logits/loss on H100s; T4/fp16 not tested. Cosine loss on normalized
+       targets should be fp32. (FlashAttention is not mentioned in the paper text.) [corrected]
+     - Variance regularizer improved probing but HURT LM benchmarks; leave it off.
+     - Parameter counts in text vs tables are inconsistent; no code link seen.
+
+
+======================================================================
+D. OPTIMIZERS / BATCH SIZE / LR
+======================================================================
+
+5. [A] ORCA: Annealed Spectral Conditioning Optimizer
+   arXiv 2610.06116 (2026-10-05) - Yuanshi Liu, Boyuan Jiang, Liang Hou, et al.
+   https://arxiv.org/abs/2610.06116   (paper licensed CC BY-NC-SA 4.0)
+   What: Muon plus a soft orthogonality penalty on hidden matrices for the first tau = 25% of steps,
+     then switched off (plain Muon afterwards):
+       W <- W - eta*U - eta*lambda*W - eta*gamma*(W W^T - I) W,   gamma = 1
+     Two extra matmuls per matrix per step while active (~8% more matmuls than 8-step Newton-Schulz),
+     overhead vanishes after release. Embeddings / head / 1-D params stay on AdamW.
+   Evidence: LLaMA 130M, C4, seq 1024, batch 512 (~26B tokens), WSD (last 15% decay to 0.1x).
+     Val loss: Adam 2.8808, Muon 2.8505, ORCA 2.8118 (4 seeds); LR-sweep winners Muon 2.8460 vs
+     ORCA 2.8106. Also 350M (-0.019 vs Muon), 1.3B (-0.024), Qwen3 160M/0.6B, MoE 0.8B/8B.
+     The same shaping applied to Adam and SOAP lowers their loss by ~0.04 too.
+   Fit for Quark: "optim:orca" next to Muon in the Phase-2 optimizer slot. Pure matmuls (no SVD),
+     no kernels, extra memory ~0 (paper: +0.25 GB at 8B).
+   Watch for:
+     - 130M is the smallest size; token budgets are 25-105B vs our ~0.2-2B. tau, gamma and LR must be
+       re-tuned at our scale (paper's good range for tau: 0.10-0.55 at 130M).
+     - bf16/fp16 not discussed. On the T4 the Newton-Schulz precision issue already in the plan applies
+       (and the Gram term W W^T should be fp32). The AdamW-with-shaping variant may be the safe T4 path.
+     - Most ablations are single-run at 130M; the "1.66x token efficiency" figure comes from a
+       non-retuned continuation with 41.7% shaping - weak evidence, ignore it.
+     - Official code not seen (kernels for batched same-shape matrices are mentioned, not released).
+
+6. [B] BulkBoost: "Does Muon Need Fine-Grained Spectral Shaping?"
+   arXiv 2610.07497 (2026-10-05) - Meher Chaitanya, Tianyi Zhou, Aristides Gionis
+   https://arxiv.org/abs/2610.07497
+   What: keep Muon's top singular directions at gain 1 ("spike" band, BB-Static: top 5%) and amplify the
+     rest by rho = 4 ("bulk" band), then rescale so the update's Frobenius norm matches plain Muon.
+     SVD-free: Polar Express for the polar factor plus warm-started block power iteration (q = 6).
+   Evidence: this is one of the few papers tested BELOW 100M. Pythia 14M / 31M / 70M / 160M / 410M,
+     continued pretraining (not from scratch) ~100M tokens each, seq 1024, 30 model x corpus settings
+     (5 sizes x 6 corpora: FineMath-4, FineMath-3, CodeParrot, Wiki-de/zh/ar), 3 seeds. BB-Static
+     beats Muon in 23/30 (2 ties); BB-Adaptive 24/30. Mean loss gain vs Muon only ~0.07% of the starting
+     loss. Per-setting differences are tiny (e.g. Muon 3.086 vs BB-Adaptive 3.085 at 14M). [corrected]
+   Fit for Quark: "optim:muon+bulkboost" as an ablation next to ORCA, not instead of it.
+   Watch for:
+     - Step time ~1.19-1.27x Muon (static) / 1.36-1.50x (adaptive, needs two half-batch gradients).
+     - Continued pretraining from converged (AdamW-trained) Pythia checkpoints only; no from-scratch run.
+     - The "~7.8% / ~8.0% tokens saved" averages only the settings and seeds that beat Muon, so it is
+       biased upward. Plain Muon was best on several corpora at 160M. [corrected]
+     - Best fraction varies by setting; the "best fraction" row is tuned on reported loss (not fair).
+     - Precision and code not stated.
+
+7. [C] The Best Optimizer Depends on Batch Size (planner guidance, not a module)
+   arXiv 2610.08975 (2026-10-06) - Xingyu Dang, Kaiyue Wen, Sadhika Malladi
+   https://arxiv.org/abs/2610.08975
+   What: after per-batch-size tuning, the best LM-pretraining optimizer changes with batch size, and no
+     single Muon batch-size scaling rule works across settings.
+   Evidence: Modded-NanoGPT benchmark (~85M hidden-matrix params in the branching experiments), ~1.7B
+     tokens, batches 128K / 512K / 1M / 2M tokens; Adam, Lion, Muon, SOAP, Shampoo. SOAP best from
+     128K to 1M (up to 0.012 nats ahead); Shampoo best at 2M; Muon vs Shampoo within +-0.004 nats.
+     Best LM scaling rule: keep LR, scale matrix weight decay linearly (1M and 2M). Keep Adam beta1 /
+     Muon momentum fixed when changing batch size. Effect shrinks after LR decay.
+   Fit for Quark: planner rule/guard. Do not hard-code "Muon > AdamW"; make the optimizer prior depend
+     on effective batch size, and re-verify when grad-accum changes it.
+   Watch for:
+     - Smallest batch tested is 128K tokens; ours is ~8-65K per step unless we accumulate. The rules are
+       NOT shown to hold at our batch sizes; gaps are tiny (0.0003-0.012 nats) and near seed noise.
+     - Hardware/precision not seen. SOAP's state is 2m^2+2n^2 per matrix (7.6 GB optimizer state at 350M
+       in another paper's table), so SOAP likely only fits our 8 GB at <= ~100M params (my estimate).
+
+8. [B] Learning Rate Transfer for Hybrid Transformer-SSM Architectures (also covers pure transformers)
+   arXiv 2610.01172 (2026-10-01) - Jimin Seo, Gyubok Lee, Yeonsik Jo, et al.
+   https://arxiv.org/abs/2610.01172
+   What: "naive muP" + AdamW (beta2 0.95): embeddings N(0,1), hidden N(0,1/d_model), zero-init output
+     head, hidden-layer LR = eta_base / d_model. Optimal base LR stayed at 1.0 across widths 256-1024
+     for all 7 architectures INCLUDING a LLaMA-style pure transformer (0.0% transfer gap).
+     Standard parameterization incurred a 1.1-8.7% penalty (FineWeb-Edu) / 1.9% (Nemotron-H) when
+     the proxy LR was reused.
+   Evidence: proxy w=256, depth 8 (~58M) -> target w=1024, depth 32 (~624M), but that depth+width test is
+     on hybrids (MHMH/HHHH); the pure-transformer (TT) evidence is width 256-1024 only. Also 8x width
+     to 1.24B. [corrected]
+     Short sweeps 2k steps on WikiText-2 (seq 128, batch 64); validated 20k steps on WikiText-103;
+     FineWeb-Edu proxy (w=256, d=16) transferred to a 5B-token run.
+   Fit for Quark: planner/estimator. Gives the LR-selection rule the plan lacks: sweep LR once at a
+     w=256 proxy (cheap on the 3070 Ti), transfer up with eta/d_model, run one verification at target
+     width. d_model 256-1024 is exactly Quark's range. Also supports comparing candidates fairly
+     (same-tuned LR per architecture).
+   Watch for:
+     - AdamW only: Muon with its recommended scaling did NOT transfer in this paper (Sophia did).
+       Muon/ORCA/BulkBoost still need their own LR sweeps.
+     - Several optima sat at the TOP of the LR grid (1.0); extend the grid.
+     - The coordinate check FAILS on hybrids yet transfer holds, so do not use it as a go/no-go test.
+     - Inconsistencies: FineWeb-Edu run listed as 5.0B vs 5.5B tokens; SP variance written as 1/sqrt(d)
+       and 1/d. Code not seen. GPUs were 24-80 GB; memory not addressed.
+
+9. [C] Why Does Adaptive Batching Help LLM Pretraining? (Batch-size schedule)
+   arXiv 2610.02355 (2026-10-01) - Arda Fazla, Antesh Upadhyay, Ege C. Kaya
+   https://arxiv.org/abs/2610.02355
+   What: batch grows in powers of two: k_t = 2^ceil(log2(1 + (B^2/G^2) * ||x_t - x_0||^a)), batch
+     b_t = k_t * b_0, LR multiplied by sqrt(k_t) for Adam. Needs only the distance from the initial
+     weights and three noise constants (B, G, a) fitted once by a perturbation measurement pass at init.
+   Evidence: OLMo2 100M / 600M / 1B on C4, ~20 tokens/param, AdamW, 5% warmup + cosine. At 100M
+     (seq 2048): batch 32 -> val 3.4609 +- 0.0037 in 30,518 steps; batch 512 -> 3.5139 in 1,908;
+     adaptive -> 3.4347 +- 0.0085 in 2,673 steps. 3 seeds. [corrected] The paper reports optimizer-step
+     counts (8.76% of small-batch steps at 100M), not wall-clock; no "20-40% wall-clock" figure was found.
+   Fit for Quark: Phase-2 "schedule" extension / trainer option for grad-accum count. Quality gain at
+     equal tokens (here ~0.026 nats vs the small batch) is the part that can transfer.
+   Watch for:
+     - The wall-clock saving comes from parallel hardware. With one GPU and grad accumulation, tokens/sec
+       is fixed, so expect fewer optimizer steps but NOT proportionally less time. Test at equal tokens.
+     - Needs a copy of x_0 (+1 param copy, small at <=100M); checkpoint must store x_0 and (B,G,a).
+     - Tested only with AdamW + cosine (WSD compatible in principle, untested); resume not discussed.
+     - Only the 100M model is within ~2x of our range; tokens/budget text has a typo-level inconsistency.
+
+
+======================================================================
+E. END-OF-RUN / CHECKPOINTING
+======================================================================
+
+10. [A] Terminal Shrinkage Averaging (TSA)
+    arXiv 2609.25482 (2026-09-21) - Adam Ousherovitch, Yixin Wang - https://arxiv.org/abs/2609.25482
+    What: return a blend of the final weights and the average of the last K checkpoints:
+        theta_hat = (1 - alpha) * theta_T + alpha * mean_j theta_{T - j*s}
+      Main setting K = 8, spacing s = 32 steps, alpha = 0.55. Optimizer is untouched; it is a
+      post-hoc change to what you return. Paper's key finding: averaging changes the best terminal-LR
+      floor - a higher floor HURTS the raw final iterate but HELPS the TSA result (interaction
+      0.0014 BPB at a 10% floor, 0.0046 at 15%).
+    Evidence: NanoChat depth-12 (286M params, seq 512, 3,000 steps, ~98M tokens), Muon + AdamW; also
+      depth-22 at 9 tokens/param (3 seeds; gain only ~0.0007 BPB, 1 of 3 seeds clears the CORE threshold -
+      the authors call it preliminary). Gains are small.
+    Fit for Quark: costs almost nothing and matches the plan's "keep last K checkpoints" design. Implement
+      as a post-training "export averaged checkpoint" step (and a trainer option to save a short burst of
+      checkpoints at the end). The interaction with the LR floor is relevant to the plan's
+      "extend a WSD run from a pre-decay checkpoint" idea.
+    Watch for:
+      - Not tested with WSD vs cosine explicitly (NanoChat's native cooldown with a floor clamp).
+      - Stores K snapshots (bf16 in the paper): negligible at 10-100M params, but at 100M x 8 x 2 B
+        = 1.6 GB, check against Drive/disk limits.
+      - [corrected] Not Muon-only: the floor x TSA interaction also replicates under pure AdamW (smaller:
+        0.0008 / 0.0025 BPB at 10% / 15% floors, positive in 5/5 runs). Depth-12 TSA gain itself is
+        ~0.0007 BPB. Hardware 8xH100; no code for TSA itself seen.
+      - Keep the plan's rule of holding fp32 weights; averaging in bf16 snapshots loses precision.
+
+
+======================================================================
+F. REVIEWED AND KILLED / NOT SELECTED (with reasons)
+======================================================================
+
+Hard kills (would not work for our project or GPUs as published):
+
+- 2610.05126  Selecting Repetition Counts Across Model Scales in Data-Constrained Pretraining.
+  Procedure needs 3 sizes x 7 repetition counts x 3 seeds = 63 runs per corpus (up to 6B tokens each),
+  to predict choices for 200M-520M targets; setup assumes a 100M-token target pool mixed 80/20 with a
+  generic stream, which does not map to a single fixed dataset like TinyStories. Takeaway worth keeping
+  (best repetition count shifts with model size; reusing the small model's choice failed) but the
+  method is out of budget.
+- 2610.06963  WavePrune: One period is often enough for RoPE.
+  Per-channel windowing (each RoPE channel limited to its first period) is not expressible as a single
+  SDPA mask; the paper's speed/benefit comes from custom FlashAttention-2-based kernels (bf16, A100),
+  and a stock-SDPA route would be an O(T^2) eager path with no speed gain. Pretraining tests are GPT-2
+  117M-774M at ctx 2048 (relevant scale) but the gain targets long-context extrapolation, which DaRoPE/HoPE
+  already cover with SDPA-compatible code. Llama3.1-8B regressed in its own table.
+- 2609.34681  SOLAR: a state-driven online LR scheduler (PPO controller).
+  Adds a PPO actor-critic into the training loop with per-group LR control, its own checkpoint-abort
+  hook, ~15 new hyperparameters, no code seen, and no statement about resuming policy state after an
+  interruption (Colab). Mostly single-seed; hyperparameters were chosen once at 60M. Conflicts with the
+  plan's deterministic WSD "early cooldown on plateau" logic.
+- 2610.00673  Closing the Loop: practical training recipes for looped LMs.
+  Smallest model 1.4B, 310B tokens from scratch, 64 GPUs/FSDP/FlashAttention-3. Nothing below 500M.
+  Portable observations only (fixed T=4 instead of 8, final RMSNorm before the head matters, post-norm and
+  sandwich-norm failed, exit-gate collapse is invisible in LM loss).
+- 2610.04204  Clean / Q-Clean: second-order training at linear memory (Nystrom sketching).
+  Only 350M and 1.3B on 4xH100, ranks tuned at 256 (as large as our widths), precision of QR/Cholesky/
+  SVD steps unstated (T4 risk), no code seen. Still trails SOAP in PPL, uses more memory than Muon.
+  Memory saving is irrelevant at <=100M where SOAP/Muon already fit.
+- 2609.39813  Backward-State Policy Is Part of the Learning Algorithm.
+  Concerns FP8/FP4 backward rounding reuse (TransformerEngine on Hopper/Blackwell, 390M and 1.5B).
+  No fp16/GradScaler or bf16-autocast result; nothing actionable for our precision modes.
+- 2610.04002  Do Language Models Need a Trainable Input Embedding Table?
+  1.7B, 100B tokens, one run per variant, trainable embedding was better on most benchmarks and the
+  output head stays a full VxD matrix. At small vocab (4-8k) the saved table is only a few M params;
+  no evidence below 500M.
+- 2610.10154  HySPE: positional encoding via symplectic dual shears.
+  Single author, tests at 4.8M byte-level and one 51M WikiText run, RoPE-only baseline (no YaRN or
+  DaRoPE), in-domain PPL 4.3% worse than RoPE, not a q/k drop-in (needs eigenbasis projections and
+  block-wise SDPA calls), exponent bounds fail in fp16 (only fp32/bf16 tested).
+- 2610.04867  Greedy Local Learning for LM pretraining.
+  Measurement study, not a method: still +0.04 to +0.13 nats worse than end-to-end, extra auxiliary-head
+  FLOPs (+39% to +97%), smallest model 125M, single seed, stage footprint at 400M already above 8 GB.
+- 2610.06578  DGA-Muon.
+  1.38B only, 8xA100, no seeds, no plain-Muon end-to-end comparison, small-scale ablations omitted.
+- 2609.37535  Why Adaptive Optimizers Underestimate Rare Tokens.
+  Theory is plausible but the LM experiment is a 64-dim MLP on a synthetic Markov chain, CPU, no seeds
+  reported. Only cheap advice (higher beta2, check rare-token calibration) is usable.
+- 2610.06387  Scaling Down the Scaling Laws.
+  A single-author narrative literature review, not an empirical study; no fitted small-scale
+  coefficients, no estimators. Not usable for the planner.
+
+Not selected (feasible, but outranked or evidence below our scale):
+
+- 2610.10975  Optimizing LLMs with Chained LMOs (TensorChain). Qwen3 0.6B / 1.7B only, 1M-4M-token
+  batches, single seed, 7.8-12.8% token savings vs Muon, Newton-Schulz in bf16; no evidence <0.6B and
+  ORCA is better evidenced at 130M. Revisit if ORCA doesn't pan out.
+- 2610.10114  Mechanics of Long-Context Hybrid Models, Part 1.1 (hybrid position). 376M-3B, 50B tokens,
+  8xH200; the training-free extrapolation (SWLA) needs FLA gated-linear-attention kernels. Design hints
+  worth remembering: ~3:1 position-biased : NoPE ratio, log-scaled NoPE attention, SWA via an SDPA banded
+  mask. Overlaps with Dawes et al. (2609.38109) in ml_papers.txt. Nothing below 376M.
+- 2609.38530  Shifting Mechanisms: positional encoding and in-context retrieval. Analysis of 665M
+  checkpoints at 16K-32K context, no LM loss; supports "NoPE in global layers shifts retrieval to
+  semantic matching, but hurts discriminating confusable keys".
+- 2609.38764  Lasting Effects of Abstract Pretraining Beyond Perplexity. A short synthetic stack-
+  manipulation warm-up (~1% of tokens) improved multi-hop QA F1 by +0.9 to +3.9 at 135M while LM loss
+  was equal or worse; needs a QA fine-tuning pipeline (our evals are a later phase), code not yet released.
+
+Screened by title/abstract only (not read in full): Hybrid Latent Attention for Looped LMs (2610.07940,
+inference/KV cache), InfiLoop (2610.11570, test-time iterations), River-Valley / WSD momentum theory
+(2609.30957), Trajectory Soup (2609.37169, large-scale mid-training merges), LoopOPD and other
+distillation/RL papers, MoE-only items (ExpertMuon-Compass, ID Balancing).
+
+
+======================================================================
+G. HOUSEKEEPING AGAINST ml_papers.txt
+======================================================================
+
+- "A Self-Pruning Transformer: Extreme KV-Cache Compression with Universal Attention" now has an arXiv
+  ID: 2610.09051 (2026-10-06, Wertheimer et al.). Fit assessment is unchanged (KV cache is not a
+  bottleneck at our context lengths).
+- The "DaRoPE" entry (2609.34556) remains the position-slot choice; none of the new position papers
+  (WavePrune, HySPE, LayerRoPE-as-depth-encoding) beat it for our constraints. LayerRoPE is about the
+  norm slot, not the token-position slot.
+- Suggested build order from this list: (1) TSA in the trainer/export, (2) gated values + sink in the
+  attention slot, (3) ORCA next to Muon, then ablate BulkBoost, (4) LR-transfer rule + batch-size-aware
+  optimizer prior in the planner, (5) LayerRoPE and OrthoInj/truncated BPTT when the looped block lands.

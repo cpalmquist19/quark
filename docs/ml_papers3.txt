@@ -1,0 +1,626 @@
+ML PAPERS 3 - fresh arXiv sweep (window: ~2026-04 to 2026-10-09), compiled 2026-10-09
+=====================================================================================
+Lens used for every paper (Quark goals):
+  * Small-scale pretraining from scratch (~10M-300M params) on ONE consumer GPU:
+    RTX 3070 Ti laptop 8 GB (Ampere sm_86, bf16 ok) and Colab T4 15 GB (Turing sm_75, fp16 only,
+    no FlashAttention-2, ~12 h sessions).
+  * Want: better loss / capability per parameter AND per GPU-hour vs a vanilla GPT
+    (RoPE+RMSNorm+SwiGLU+AdamW+cosine baseline).
+  * Kill criteria: needs bf16/H100-only kernels with no fallback, only helps at >1B params,
+    only an inference/serving trick, needs multi-GPU, or needs a huge model as teacher.
+
+Verdict tags:
+  [ADOPT]   strong fit, implement as a component
+  [TRY]     plausible gain at our scale, worth an ablation
+  [NOTE]    planner guidance / useful knowledge, not a module
+  [SKIP]    reviewed, not worth it for us (reason given; kept short)
+
+-------------------------------------------------------------------------------------
+EXECUTIVE SUMMARY (read this first; details per paper below)
+-------------------------------------------------------------------------------------
+Goal: the best small LM we can train on a 3070 Ti 8 GB / Colab T4, with FAR FEWER params than
+usual for its quality class. The two strongest levers found this sweep:
+
+  (1) Parameter reuse at equal compute. Hyperloop (B2) matches or beats a depth-matched
+      Transformer with ~45-57% of the params. Attractor Models (E1) beat a param-matched
+      Transformer by ~15% val ppl at 140M with constant training memory in depth. The
+      iso-depth scaling law (B1, phi = 0.46; 0.65 with hyper-connections) lets the planner
+      price these trades honestly.
+  (2) Nearly-free per-layer upgrades validated AT OUR SCALE: LayerRoPE (C1, -0.07 loss at
+      134M, fewer params, 3-10x wider LR basin), value residual / SATFormer (C2), sink logit +
+      value gate (E2), front-loaded FFN widths (F1).
+  Plus optimizer upgrades on top of Muon: SAMuon-lite (A2, 13-24% fewer tokens), AF-Muon for
+  tied embeddings (A4), ORCA (A3), scaled WD (A5), and the planner rules from A1/D1.
+
+Recommended ablation order (each one vs the previous best, same token budget, 2+ seeds at
+~30-60M to start; the cheapest and most certain come first):
+   1. Baseline: RoPE/DaRoPE + RMSNorm + SwiGLU + QK-norm + tied emb + Muon(+AdamW) + WSD
+   2. + LayerRoPE (C1)                       ~40 lines, 0 FLOPs
+   3. + value residual (C2), then SATFormer gate
+   4. + sink logit (+ proj value gate at >=100M) (E2)
+   5. + SAMuon-lite bulk gain (A2); + scaled WD (A5) or Hyperball (A6), not both
+   6. + AF-Muon for the tied table (A4); + ORCA early orthogonal reg (A3)
+   7. FFN width schedule front-loaded (F1)
+   8. ARCHITECTURE BAKE-OFF at equal FLOPs: plain vs Hyperloop [begin|mid x r|end] (B2, with
+      B4 orthogonal injection, C4 symmetric-break stream init, G1 depth-aware init) vs
+      Attractor (E1). Optionally + LPT shared KV (B3) or LoopMTP (C6).
+   9. Data-side extras: stack-task warm-up 1% (E3); weak-teacher KD (F3); MIR for multi-epoch
+      (A8)
+Planner rules to add now: Step-Law-small LR/batch formulas (D1), WD ~ sqrt(overtraining)
+(A1), phi-based looped quality estimate (B1), batch-size caveat for optimizer priors (A9),
+deep-thin shapes at 50-150M (D2), no n-gram memory with repeated data (D4), and penalize
+GQA+SWA+short ctx for the long-context purpose (E4).
+
+Hardware notes: everything recommended is pure PyTorch + SDPA, with no flash-attn/Triton
+required. On T4 (fp16): keep Muon Newton-Schulz and any fixed-point solver in fp32. The sink
+logit needs a float attn_mask, so SDPA uses the mem-efficient kernel (fine on both GPUs).
+Gated-DeltaNet hybrids (F2) are deferred until WSL2/Triton is confirmed.
+
+-------------------------------------------------------------------------------------
+
+=====================================================================================
+SECTION A - OPTIMIZERS, WEIGHT DECAY, LR SCHEDULES
+=====================================================================================
+Context: Muon (Newton-Schulz orthogonalized momentum on 2-D hidden matrices; AdamW for
+embeddings/head/norms) is the established baseline upgrade. On T4 run Newton-Schulz in fp32
+(fp16 NS can overflow); at <=300M params the fp32 NS matmuls are cheap relative to fwd/bwd.
+The 2026 literature is now about *improving on Muon*. Many variants exist; most are tested at
+>=1B or give ~0.1% gains. The ones below survived because they were validated at 51M-253M or
+are nearly free to implement.
+
+A1. [ADOPT] Optimizer Memory Schedules for Outscaling the Overtraining Axis
+    arXiv 2609.04577 (2026-09-04) - Everett, Qiu - https://arxiv.org/abs/2609.04577
+    What: AdamW vs Muon vs SOAP vs ADANA at exactly our scale (51M-253M params), with the LR
+      swept at every point, across overtraining factors from 1x to 256x Chinchilla.
+    Findings that matter to us:
+      - Muon and SOAP give a roughly CONSTANT token-efficiency gain over AdamW across horizons.
+        This makes Muon a safe default and gives the planner a fixed "effective compute"
+        multiplier for it.
+      - The best weight decay scales roughly as sqrt(overtraining factor). Small models on
+        a consumer GPU are usually overtrained (many tokens per param), so WD should rise with
+        the token budget.
+      - The best LR schedule can REVERSE between short and long horizons. Don't hard-code one.
+      - ADANA (momentum-scheduled AdamW) with log-time WD + momentum cooldown overtakes Muon at
+        very long horizons. Note it as a future option for long Colab runs.
+    For Quark: planner rules (WD = base * sqrt(tokens / (20*N))) plus the Muon prior multiplier.
+    Cheap, high value. No code module needed beyond a WD rule.
+
+A2. [ADOPT] SAMuon / SAMuon-lite (Spectral-Aware Muon)
+    arXiv 2608.25990 (2026-08-26) - Wu, Yu, Zhang, Woodland - https://arxiv.org/abs/2608.25990
+    What: Spectral probing shows that a few top singular directions ("head", at edge of stability)
+      need small steps, while the large "bulk" tolerates much bigger steps than Muon gives it.
+      SAMuon-lite pins the top direction(s) at Muon scale (power iteration, rank 1) and amplifies
+      the rest of the orthogonalized update by one scalar gain. Uses 30% "spectral warmup"
+      for the gain.
+    Evidence: modded-nanogpt 124M -> 1B. Needs 13-24% fewer tokens than Muon for the same
+      val loss. Lite keeps most of that with ~zero wall-clock overhead. No extra optimizer state.
+    Caveats: Tested at large batches (1024-4096 seqs). Our effective batch is much smaller, and
+      2610.08975 (A9) shows optimizer rankings can flip with batch size. Needs an ablation.
+    For Quark: optim/muon.py gets a `bulk_gain` option (1.0 = plain Muon). It's ~20 lines.
+      Strong candidate.
+
+A3. [TRY] ORCA - Orthogonal Regularization, Cooled After
+    arXiv 2610.06116 (2026-10-05) - Liu, Jiang, Hou, Tao, et al. - https://arxiv.org/abs/2610.06116
+    What: Adds a strong soft-orthogonality penalty on weight matrices during an early window of
+      training, then switches it off abruptly at one step. Used with Muon (8 NS iterations, Polar
+      Express coefficients). For MoE they release the layers in a staggered way (first layer at
+      20%, last at 60%).
+    Evidence: LLaMA/Qwen3 from 130M to 8B. Claims ORCA's gain over Muon >= Muon's gain over Adam,
+      and the 130M LLaMA is one of the tested sizes. Minimal overhead.
+    Caveats: Brand new (5 days old) and unreplicated. Licensed CC BY-NC-SA. Two new hyperparameters
+      (strength, window). Could stack with SAMuon, but this is untested.
+    For Quark: a "trick" toggle that adds a penalty for steps < release_step. Cheap ablation.
+
+A4. [TRY] AF-Muon - AdamW-free Muon for tied-embedding models
+    arXiv 2610.01395 (2026-10-01) - Lagzian et al. - https://arxiv.org/abs/2610.01395
+    What: Small models almost always TIE embeddings, and the vocab table is a big share of the
+      params (e.g. 50k x 512 = 25M). AF-Muon replaces the AdamW fallback for the tied table with a
+      "support-aware finite-cap" LMO update, and uses RMS-normalized updates for 1-D params.
+      This removes all second-moment state.
+    Evidence: decoder LMs 124M-1B plus other modalities. Beats Hybrid Muon (Muon + AdamW) on val
+      loss. ~20% less optimizer memory, ~1% step overhead. Accepted at the NeurIPS OPT workshop.
+    For Quark: helps both quality and the 8 GB budget. Pair with weight tying. Keep Muon+AdamW
+      as the fallback.
+    Related, same idea for UNtied I/O layers: MuonIO 2610.02705 (column-norm embedding, row-norm
+      head; tested at 1B). [NOTE] Use it only if tying is off.
+
+A5. [TRY] Scaled weight decay (Muon-SW): WD_t = WD * lr_t / lr_max
+    arXiv 2607.23777 (2026-07-26) - Apte - https://arxiv.org/abs/2607.23777
+    What: One line. WD decays together with the LR schedule, so the weight norm settles instead of
+      steadily shrinking. Reached the same loss ~30% faster at the largest scale (72M-930M,
+      ~600 tokens/param, MoE models).
+    Caveats: Shown on MoE only, single author. 600 tok/param is close to our regime, though.
+    For Quark: a `wd_schedule: constant|lr_scaled` option. Trivial to ablate.
+
+A6. [TRY] Hyperball (Fantastic Pretraining Optimizers II) + its critique
+    arXiv 2606.16899 (2026-06-15) - Wen, Dang, Lyu, Ma, et al. - https://arxiv.org/abs/2606.16899
+    Critique: "Hyperball May Not Be a Free Lunch" arXiv 2607.22444 (code on GitHub)
+    Also: "Effective Learning Rate Governs Loss Dynamics" arXiv 2608.24814
+    What: Replaces weight decay. Fix each weight matrix's Frobenius norm AND the update's norm
+      (project back to the sphere after each step), so the angular LR is controlled directly.
+      Muon-Hyperball: 20-30% token-equivalent speedup vs weight decay (Qwen3-style, up to 1.2B).
+      Better LR transfer across widths and depths. That's useful for us: tune on a tiny model and
+      transfer the settings.
+    Critique: The gain comes from the effective-step-size schedule, not a better direction. MuonH
+      starts slower and overtakes later, and aggressive LR decay can hurt it. ELR paper: WD and
+      Hyperball both act only through effective LR = LR / ||W||.
+    For Quark: a `norm_control: weight_decay|hyperball` slot. It's an ALTERNATIVE to A5 (scaled
+      WD), not a complement, and needs its own LR schedule. Overlaps with A1's WD rule.
+
+A7. [NOTE] WSqD - horizon-free LR schedule
+    arXiv 2607.10959 (2026-07-12) - Ma, Chen - https://arxiv.org/abs/2607.10959
+    What: WSD, but the stable phase is a shifted 1/sqrt(t) decay. Peak LR is horizon-independent,
+      so you can EXTEND a run (resume from pre-decay) without the peak becoming wrong. Matches
+      or beats tuned WSD on SlimPajama.
+    For Quark: fits the Colab "keep training across sessions" workflow perfectly. Add it as a
+      schedule option next to WSD. It costs ~10 lines.
+
+A8. [NOTE] Data-Constrained Pretraining: Masked-Input Regularization (MIR) + SoftQ scaling law
+    arXiv 2606.06888 (2026-06-05) - Xu, Wu, Cho, Hu, et al. - code: github.com/yixinw-lab/dc_pretrain
+    What: For MULTI-EPOCH training on a finite dataset (common for us: TinyStories or a domain
+      corpus), add an auxiliary next-token loss on a randomly masked copy of the input, on top of
+      strong WD. It worked at 72M-1.4B and is worth ~1.3x more unique data. No inference cost.
+      SoftQ is a scaling law that fits repeated-data runs better than Chinchilla.
+    Cost: one extra forward/backward on the masked copy (~2x compute per step) or a split batch.
+      Check the repo for how they budget it.
+    For Quark: [TRY] when the planner detects > ~2 epochs. Use SoftQ in the planner's
+      quality estimator when data is repeated.
+
+A9. [NOTE] The Best Optimizer Depends on Batch Size
+    arXiv 2610.08975 (2026-10-06) - Dang, Wen, Malladi
+    No principled Muon batch-size scaling rule works consistently, and the winning optimizer
+    changes with batch size. Our batches are small (memory-bound). Any "X beats Muon" claim made
+    at 1M+ token batches needs re-checking at ours. This is a planner warning.
+
+A10. [NOTE] PACE (pull live weights toward their EMA) / Terminal Shrinkage Averaging
+    arXiv 2606.25086 (PACE, GPT-2 FineWeb pretraining gains) and 2609.25482 (TSA)
+    Cheap at our scale: keep a weight EMA (memory = 1 extra copy, fine at <300M) and evaluate
+    the EMA. PACE adds a clipped pull of the live weights toward the EMA. Low-risk add-on, but
+    it overlaps with WSD cooldown gains. A later ablation.
+
+Reviewed in this cluster and SKIPPED (one line each):
+  - MeqMuon 2609.35701, DGA-Muon 2610.06578, NorMuon variants: row/col-equilibrated Muon,
+    incremental over A2/A4. Revisit only if A2 fails.
+  - BulkBoost 2610.07497: same insight as SAMuon, but tested only in continued pretraining, with
+    ~0.1% loss gains. SAMuon (A2) is the from-scratch version.
+  - Musec 2609.11655: a stability fix for Muon divergence. At our scale QK-norm + lower LR is
+    enough. Keep it in mind only if fp16 Muon on T4 spikes.
+  - AMUSE 2605.22432: schedule-free Muon. Interesting for "anytime" training, but WSqD/WSD cover
+    it more simply.
+  - LionMuon 2609.35297, Dion3 2608.11612, adaptive-NS 2609.33047: they cut Muon's NS/communication
+    cost, which matters at scale and multi-GPU. NS isn't our bottleneck.
+  - Clean 2610.04204, SoftServe, GO-Muon, Newton-Muon 2604.01472: second-order or extra state.
+    Memory-heavy, small or unclear gains for us.
+  - Spectrally Targeted Muon 2610.10965, Soren, COREM, Pion, RODE: analysis or unproven variants.
+  - Why Adaptive Optimizers Underestimate Rare Tokens 2609.37535: theory. Muon preserves the mean
+    output embedding and Adam doesn't. That supports A4 (Muon-style updates for the vocab
+    table), but it isn't a module.
+
+=====================================================================================
+SECTION B - LOOPED / RECURRENT-DEPTH (the main "fewer params, same quality" lever)
+=====================================================================================
+Big picture first. A looped model reuses a block r times, so the params drop but the training
+FLOPs per token stay those of the UNROLLED depth. The question for us is whether looping beats
+a non-looped model at the same COMPUTE with fewer PARAMS, which is the project's stated ideal.
+As of 2026-10 the answer is yes, but only with the right design (begin/middle/end split +
+hyper-connections or shared memory). Naive looping loses at equal compute.
+
+B1. [NOTE - core planner math] How Much Is One Recurrence Worth? Iso-Depth Scaling Laws
+    arXiv 2604.21106 (2026-04-22, v3) - Schwethelm, Rueckert, Kaissis - https://arxiv.org/abs/2604.21106
+    Fits L = E + A*(N_once + r^phi * N_rec)^-alpha + B*D^-beta. Finds phi = 0.46. Looping a block
+      4x is worth about 4^0.46 = 1.9 unique copies, not 4. Example: at r=4 a 410M looped model
+      ~ a 580M plain model, but it costs the training compute of a 1B plain model.
+    Hyper-connections raise phi to 0.65 (a real capacity gain). Truncated BPTT LOWERS phi to 0.38
+      (it trains the loop badly, even though val loss looks fine).
+    For Quark: drop this formula straight into the planner's quality estimator for looped
+      configs. It is exactly what's needed to rank "looped, fewer params" against "plain, more
+      params" honestly. Also a rule: no truncated BPTT by default.
+
+B2. [ADOPT] Hyperloop Transformers (looped middle block + hyper-connections between loops)
+    arXiv 2604.21254 (2026-04-23, v3 Jul) - Zeitoun, Torroba-Hennigen, Yoon Kim (MIT) - CC BY 4.0
+    What: Layers split [begin | middle x r | end], e.g. [2L | 4L x3 | 2L] = 16 unrolled layers
+      from 8 unique ones. Only the middle block loops. Hyper-connections (n parallel residual
+      streams with small learned mixing) are applied only BETWEEN loops. That adds just 150-300K
+      params and ~2-5% throughput cost (mHC on every layer costs ~35%).
+    Results (FineWeb-Edu, AdamW + cosine, the SAME unrolled depth, so the same train FLOPs/token):
+      d=1024 depth 16, 12.5B tok: Transformer ppl 14.65 | Looped 14.85 | Hyperloop 14.40
+      d=2048 depth 18, 50B tok:   Transformer 10.19   | Looped 10.02 | Hyperloop  9.65
+      d=2048 depth 38, 100B tok:  Transformer  8.60   | Looped  8.68 | Hyperloop  8.49
+      Hyperloop uses ~50% of the baseline's params and also leads on downstream accuracy.
+      INT4 GPTQ quantizes well too.
+    HONEST CAVEAT (their App. C): with a better-tuned init/LR for all models at the smallest
+      size (240M baseline vs 136M Hyperloop), Hyperloop only MATCHES the Transformer
+      (13.08 vs 12.94 ppl) while mHC is best. Even so, matching with 57% of the params is the
+      project goal.
+    Fit for us: no special kernels; it's plain PyTorch. Fewer params means a smaller
+      optimizer state, which is a real win on 8 GB. Activation memory is unchanged (same
+      unrolled depth). Works with SDPA, fp16, and Muon.
+    For Quark: block/hyperloop.py, with params (n_begin, n_mid, r, n_end, n_streams=4).
+      This is the top candidate for the "small but punches above its size" model.
+
+B3. [TRY] Looped Prediction Transformer (LPT) - shared KV memory across recursions
+    arXiv 2610.02383 (2026-10-01) - Monea, Ramji, El-Kurdi, Lastras, et al. (IBM)
+    What: Only the 1st recursion writes a full KV cache. Later recursions attend to that shared
+      cache plus a short local window of their own. Unexpectedly this IMPROVES quality: the
+      shared memory acts as a gradient highway to recursion 1. The hybrid variant, with 5
+      recursions, has 1.12-1.82 lower val ppl than a same-size (param-matched) Transformer on
+      FineWeb-Edu at 150M-1B, plus 76-79% less KV memory.
+    Caveat: the comparison is param-matched (looped uses more compute). Needs custom attention
+      masking (the shared cache plus a local window). That works with SDPA by passing the
+      recursion-1 K/V and a windowed mask, so there's no special kernel.
+    For Quark: an option inside the looped block, `kv_sharing: none|first_recursion`. It
+      stacks naturally with B2 (Hyperloop's middle block). Ablate B2 vs B2+B3.
+
+B4. [TRY] Towards Looped Models Done Right, Part II: Rethinking at Fixed Points
+    arXiv 2610.06833 (2026-10-05) - Huang, Shi, Chen, Wen, et al. - code: github.com/ifm-ai/xllm-loop
+    Two cheap training-side upgrades, validated 100M-1.6B, that lower ppl at every scale:
+      (a) ORTHOGONAL INPUT INJECTION: when re-injecting the input embedding into each loop,
+          remove the component of the state that lies along the input direction, so the
+          injection can't be amplified or cancelled.
+      (b) a LEARNED depth prior (random loop counts during training, learned from prediction
+          feedback with an entropy term) instead of Huginn's fixed broad prior. This enables
+          terminal KV sharing at decode time.
+    For Quark: (a) is a few lines and applies to any looped block; implement it with B2.
+      (b) is only needed if we want variable test-time depth. Defer it.
+
+B5. [NOTE] What Makes Recurrence Effective in Looped LMs?
+    arXiv 2609.36636 (2026-09-29) - Zhuang, Wang, Razzak, Weiyang Liu
+    Design guidance: keep NON-recurrent output layers (that matches Hyperloop's "end" block).
+      Recurrence helps reasoning but can hurt knowledge/fact recall. Channel-wise
+      "history-state injection" + timestep (loop-index) conditioning beats plain initial-state
+      injection. Use it as an alternative to B4(a) when ablating.
+
+B6. [NOTE] Closing the Loop: Practical Training Recipes for Looped LMs
+    arXiv 2610.00673 (2026-09-30) - Marchenko et al.
+    A 1.4B LoopLM beats a param-matched dense model on all 12 benchmarks with the same data
+      (+14 GSM8K, +22 DROP). At matched inference compute it approaches a 3.9B dense model with
+      36% of the params. Recipe: LR warmup + stronger exit-gate regularization makes from-scratch
+      looped training stable (no multi-stage schedule). It also gives a minimal dense->looped
+      conversion (one learned input-mixing scalar + smoothed exit loss). That's useful later:
+      train a plain model, then convert it.
+
+B7. [NOTE - honest negative at OUR scale] CART: Context-Anchored Recurrent Transformer
+    arXiv 2606.01495 (2026-05-31) - Capps - code + results DB: github.com/ccapps42/CART
+    Trained on SINGLE CONSUMER GPUs, d=256-1024, ~1B tokens, 3 seeds. At the d=1024 param-parity
+      test it does NOT beat a dense baseline (-1-2% at stored-param parity, ~-10% at
+      effective-param parity). Its fancy recurrent-core parts (hyper-connections, LTI gate,
+      loop-index embedding) were individually vestigial. The prelude depth P mattered more than
+      the loop count R.
+    Lesson: at ~1B tokens and small width, looping's advantage is fragile. Hyperloop's
+      begin/end blocks echo "prelude depth dominates". Our ablation must compare at equal
+      compute AND equal params, and expect small effects.
+
+Reviewed and SKIPPED (looped cluster):
+  - LoopCD 2610.02185: a training-free contrastive decoding trick for looped models at
+    inference. Free to add later in infer/, but not a training component. [NOTE]
+  - FlashLoop 2609.29812, ResidualQuant 2610.10381, Loopy 2610.05265, WaveFront/LoopSpec/DLoop
+    decoding: inference/quantization/serving for looped LMs. Not needed at our size.
+  - Loop Dropout 2609.34218: LoRA fine-tuning regularizer.
+  - InfiLoop 2610.11570: a 7M model for Sudoku/ARC with 20k loops. Puzzle-specific, not
+    language modeling.
+  - Looped MoE papers (2609.35751, 2609.40316, 2610.01153): MoE on 8 GB at our scale is not
+    worth it (memory per expert; routing overhead).
+  - Statistical Gains from Looped Estimation 2609.25778: pure theory that agrees with the above.
+
+=====================================================================================
+SECTION C - RESIDUAL STREAM, NORMALIZATION, EMBEDDINGS, MTP
+=====================================================================================
+C1. [ADOPT] LayerRoPE - depth-wise "RoPE" on the RMSNorm gains
+    arXiv 2610.09179 (2026-10-06) - Srivastava, Kanan (U. Rochester) - CC BY 4.0
+    Project page: www.cs.rochester.edu/u/ssrivas9/layer-rope
+    What: Observes that per-layer norm gains (gamma) in trained LLMs grow and ROTATE with depth,
+      acting as an implicit layer-index code. It makes this explicit: ONE shared gamma vector per
+      norm site (pre-attn, pre-MLP) for ALL layers. Layer l's gain = shared gamma, with pairs
+      treated as complex numbers, times a depth-conditioned magnitude (log-linear in l) and a
+      rotation (per-layer base angle spread over pairs with a RoPE-like frequency spectrum,
+      base = hyperparameter). It uses ~4 scalars per site. No matmuls, ~0 FLOPs, and it has
+      FEWER params than per-layer gammas.
+    Evidence (LLaMA-style on C4, Chinchilla budget, LR tuned PER METHOD at every scale, 58M-1.3B):
+      - 134M ablation, Pre-Norm: loss 3.1003 -> 3.0317 (ppl 22.2 -> 20.7). Peri-Norm:
+        3.072 -> 3.025. Magnitude alone gives most of it, and magnitude + rotation is best.
+      - Reaches Pre-Norm's 1.3B loss with 3.4x less compute. Has a 3-10x wider LR basin
+        (great for us: fewer LR sweeps). Stable to 512 layers. It TRANSFERS TO LOOPED models
+        (Sec 4.4), so it can be combined with B2 Hyperloop.
+    Caveats: 3 days old and unreplicated. The LR sweeps are a strong point in its favor.
+    For Quark: norm/layerrope.py as a toggle on top of RMSNorm pre-norm. Implementation is
+      ~40 lines, and the depth index is just the layer number (for looped blocks, use the
+      unrolled index or loop index; check their App. D.4). This is the best effort-to-gain
+      ratio in this sweep. Ablate it first.
+
+C2. [ADOPT] Value residual (static), with SATFormer as the [TRY] upgrade
+    SATFormer: "Transformers with Selective Access to Early Representations"
+    arXiv 2605.03953 (2026-05-05) - Gunasekaran, Wright, Rui-Jie Zhu, Eshraghian
+    code: github.com/SkyeGunasekaran/SATFormer
+    What: The value residual (mix layer-1's V into every later layer's V with learned
+      coefficients, as in ResFormer/modded-nanogpt) is the cheapest "early representation"
+      shortcut. SATFormer replaces the static mixing coefficient with a context-dependent gate
+      (per token, per head), at ~baseline throughput and memory.
+    Evidence: 130M-1.3B. Beats both the static value residual and the plain Transformer on val
+      loss and zero-shot accuracy. About +1.5 points over the value residual on retrieval-heavy
+      tasks.
+    Independent support for the static value residual at our scale: JugnuLM 2609.14715 (Section
+      D) kept value residuals + Muon at 110M (ARC-Easy +3.6 combined).
+    For Quark: attention option `value_residual: off|static|gated`. Memory cost: hold V_1 for
+      the whole forward pass (one [B,T,d] tensor), which is negligible.
+
+C3. [TRY] NAG - Norm-Agnostic residual networks (+ built-in Mixture-of-Depths)
+    arXiv 2606.16112 (2026-06-15) - Figliolia, Millidge (Zyphra)
+    What: Separates magnitude from direction in the residual stream so later layers aren't
+      drowned by residual-norm growth. Gains grow with depth, so it suits deep-thin small
+      models (the JugnuLM-style 23x576 geometry). Its MoD variant skips ~20-25% of layer calls
+      while matching full-depth loss at equal training compute.
+    Overlap: C1 (LayerRoPE) tackles the same "curse of depth" from the gain side. Pick one and
+      ablate the other. LayerRoPE has stronger small-scale numbers on paper.
+    For Quark: [TRY] after C1. MoD skipping makes variable shapes, which is awkward without
+      torch.compile on Windows, so use the dense version first.
+
+C4. [NOTE] Hyper-connection practicalities (needed if B2 Hyperloop is adopted)
+    - Stream collapse: 2606.03483 (Alimaskina et al.). HC/mHC streams often collapse into one
+      dominant stream, and mixing stays near identity. Fix: BREAK SYMMETRY at stream init
+      (different init per stream). That improves all mHC variants. It's a cheap init detail to
+      bake into block/hyperloop.py.
+    - xHC 2607.14530: n=16 streams with sparse updates. Shown on 18B/28B MoE, and memory traffic
+      is the bottleneck. [SKIP] for us; n=4 is plenty.
+    - Note: in Hyperloop's tuned-init table, full mHC (on every layer) was the best small model
+      but cost ~35% throughput. On a fixed GPU-hour budget that's usually a loss.
+
+C5. [SKIP for now] Kronecker Embeddings (byte-level factorized input embeddings)
+    arXiv 2605.29459 (2026-05-28) - Shravan - code: github.com/theschoolofai/kronecker-embeddings
+    Claim: 124M nanoGPT, 2.5B tokens, 3 seeds: 2.5% lower val loss than BPE-tied, 1.43x fewer
+      steps. The input table becomes a fixed byte codec + one projection.
+    Why skip: at OUR scale it does NOT save params. Weight tying becomes impossible, so the output
+      head returns as a separate V x d matrix. The paper admits it has no UNTIED-BPE baseline,
+      so the gain may come from untying rather than from Kronecker. Revisit if someone runs that
+      control. (A cheap thing WE can test: tied vs untied at our scale.)
+
+C6. MTP cluster (multi-token prediction)
+    General fact restated in LightMTP: token-level MTP HURTS models below ~3B (Gloeckle 2024).
+    - LightMTP 2610.06031 [NOTE]: latent MTP that bootstraps targets from the model's own hidden
+      states, adds <=1% params, and the head is discarded at inference. It still has a (smaller)
+      next-token cost, with gains on planning (Countdown) and code. Up to 1.5B. Consider it only
+      for a "reasoning/planning" purpose profile, not for raw LM loss.
+    - LoopMTP 2608.03624 [TRY, only with looped models]: aligns loop t's hidden state with
+      the embedding of the token t steps ahead, plus a gate. Up to +8.1% relative accuracy vs
+      non-looped, and stable to 15 loops. It gives the loop iterations a supervision signal at
+      almost no cost. Pair it with B2.
+    - AdaMTP 2608.00434, HiLP 2608.05806, inference-MTP/speculative papers: [SKIP]
+      (7-12B fine-tuning, or decoding speed only).
+
+C7. [SKIP] Sphere Retraction Normalizations (GeoNorm family) 2608.02668
+    Spherical residual stream. Beats "lightweight deep connection schemes" on nanoGPT, but there
+    are no strong baselines or numbers at our scale, and it overlaps C1/C3. Not worth it ahead
+    of LayerRoPE.
+
+=====================================================================================
+SECTION D - SMALL-SCALE RECIPES & PLANNER CALIBRATION (directly at our size)
+=====================================================================================
+D1. [ADOPT - planner] Step Law recalibrated below 59M params
+    arXiv 2609.27581 (2026-09-23) - Romanyukov et al.
+    935 runs, nanoGPT + TinyStories, 2048-token BPE vocab, AdamW, warmup-cosine, 4 <= D/N <= 600.
+      eta*(N, D) = 0.0985 * N^-0.508 * D^0.238
+      B*(D)      = 3.6e-4 * D^0.931   (batch in tokens; independent of N)
+    Original Step Law OVERESTIMATES the optimal LR by ~4x (2.4x-6.6x) at this size. For Quark
+      these formulas go straight into the planner as AdamW defaults for N < 60M (use the
+      original Step Law above that). Muon needs its own LR rule (see A1/A9).
+
+D2. [NOTE] JugnuLM-53M vs 110M: a sub-150M ablation ladder
+    arXiv 2609.14715 (2026-09-13) - Rajput, Chauhan, Kosaraju
+    Qwen3-style (GQA, RoPE, SwiGLU, RMSNorm, QK-Norm, z-loss), FineWeb-Edu. DEEP-AND-THIN
+      23 layers x 576 hidden at 110M matched GPT-class 125M models on BLiMP with ~12% fewer
+      params and fewer tokens (8B). Kept: value residuals + Muon (+3.6 ARC-Easy). Rejected:
+      a diverse data blend, and logit distillation from a 1.7B teacher (perplexity cost).
+    For Quark: the planner's shape grid should favor deep-thin (aspect ratio d/L ~ 25) at
+      50-150M. The baseline component list is validated here.
+
+D3. [NOTE] L20-Edu-135M: full single-GPU 135M pipeline
+    arXiv 2606.22189 (2026-06-20) - Yin Li - HF: AliceYin/l20-edu-135m
+    134.5M on ONE L20 GPU, 13B tokens (10B FineWeb-Edu + 3B edu/math/code mix). Reaches 87% of
+      SmolLM-135M's zero-shot mean with 2.2% of its tokens. Documents MinHash dedup,
+      benchmark-overlap removal, and throughput tuning. GRPO RLVR at 135M made GSM8K WORSE.
+    For Quark: a realistic quality target for our hardware, and data hygiene steps for
+      quark data prepare. Don't bother with RL at this size.
+
+D4. [NOTE - warning] Forking: sudden overfitting under data replay
+    arXiv 2610.00394 (2026-09-30) - Yu, Guo, et al. - code on GitHub
+    Models with an n-gram memory branch (Engram-style hashed n-gram embeddings, a trick that
+      autoresearch agents in modded-nanogpt land like to add) show a sharp train/val split at
+      EPOCH BOUNDARIES when data is repeated. Low-frequency contexts drive it.
+    For Quark: if we ever add n-gram/Engram embeddings, the planner must forbid them with
+      multi-epoch data, and the trainer's gen-gap monitor should check at epoch boundaries.
+
+=====================================================================================
+SECTION E - ATTENTION VARIANTS, FIXED-POINT MODELS, DATA-SIDE TRICKS
+=====================================================================================
+E1. [TRY - high upside] Attractor Models ("Solve the Loop")
+    arXiv 2605.12466 (2026-05-12) - Fein-Ashley, Rashidinejad (USC)
+    code: github.com/jacobfa/Attractor - site: attractor-models.github.io - CC BY 4.0
+    What: Standard Transformer backbone proposes output embeddings. Then an "attractor" block is
+      iterated to its FIXED POINT (Anderson acceleration, or just a few plain iterations), with
+      gradients from implicit differentiation using a ONE-STEP backward approximation. So
+      training MEMORY is constant in effective depth: there's no backprop through every loop,
+      which is ideal for 8 GB. The model learns to put its initial proposal near the
+      equilibrium ("equilibrium internalization"), so the solver can be DROPPED at inference
+      with little loss.
+    Evidence (nanochat recipe, FineWeb-Edu, PARAM-matched, same data/optimizer/schedule):
+      140M: Transformer val ppl 21.48 | Parcae (looped) 19.06 | Attractor 18.30 (-14.8%);
+            Lambada ppl 127 -> 68. Gains hold at 370M and 770M. The 770M model ~ a 1.3B
+            Transformer trained on 2x tokens. Ablations are at 60M / 1B tokens (our regime).
+            One-step backward ~ Anderson quality and is much cheaper.
+    Caveats: Param-matched, NOT compute-matched; the forward solver iterations add FLOPs that
+      I couldn't find quantified in the text, so we must MEASURE tokens/sec. Only one group so far.
+      Implicit-diff models can be finicky in fp16 (T4): keep the solver in fp32 or bf16 on the
+      3070 Ti.
+    How it relates to Section B: it's an alternative to explicit looping (B2 Hyperloop),
+      because it buys depth-like refinement without the r-times activation memory. Both
+      directly serve the "fewer params" goal. Ablate B2 vs E1 head to head at ~60M.
+    For Quark: block/attractor.py (backbone + fixed-point block + one-step grad). Start from
+      their repo.
+
+E2. [TRY - cheap] Sink logit + value gate ("Abstention and Noise Filtering")
+    arXiv 2609.22005 (2026-09-18, v2) - Richard Zhe Wang
+    What: Two missing softmax primitives, each given its own mechanism:
+      - ABSTENTION: a learnable per-head "sink logit" (a phantom key with a learned logit and a
+        zero value, as in gpt-oss), so a head can output ~nothing.
+      - FILTERING: a gate on each value read, either a norm gate or a projection gate
+        sigmoid(linear(v)), i.e. value-state gated attention.
+    Evidence: 10M/50M/124M/350M from scratch on FineWeb-Edu, 3 paired seeds (rigorous for this
+      scale). Abstention gain: 0.0185 nats at 10M, shrinking to ~0.005 at 124M. Filtering gain:
+      0 at 10M, rising to ~0.009 at 350M. The two are mostly additive, so sink+proj is best.
+      Small but nearly free, and it removes attention sinks (helps fp16 stability and
+      quantization).
+    SDPA note: the sink logit = append one extra key column through a float attn_mask
+      (per-head bias), with a zero value row. Works with the mem-efficient kernel on T4.
+      The flash kernel doesn't accept arbitrary masks, so on the 3070 Ti the mem-efficient
+      kernel would be used (a small speed hit).
+    For Quark: attention toggles `sink_logit` and `value_gate: none|norm|proj`. At <=50M prefer
+      sink_logit alone. Above ~100M add proj.
+
+E3. [TRY - data] Abstract "stack" warm-up before natural-language pretraining
+    arXiv 2609.38764 (2026-09-30) - Shinnick, Saratchandran, Teney, van den Hengel
+    Project: zlshinnick.github.io/beyond-perplexity
+    What: Spend ~1% of the token budget FIRST on an algorithmically generated stack-manipulation
+      task, then train normally. In SMALL LMs this improves multi-hop QA (+3.9 F1 MuSiQue,
+      plus HotpotQA and 2Wiki) at equal perplexity. The structure matters (stack works, queue
+      doesn't). The timing matters (it must be a dedicated initial phase; mixing it in or
+      adding it later doesn't work). The benefit persists through billions of tokens.
+    For Quark: a `data.warmup: stack_task(1%)` option. Generator is trivial and costs nothing
+      in memory. Note: loss curves won't show the benefit, so it only shows up in evals.
+
+E4. [NOTE] Cracks in the Foundation (COLM 2026) 2608.10296 - Bertsch, Soldaini, Neubig, et al.
+    Four "minor" choices (normalization type, GQA, short pretraining context, sliding window)
+    each slightly hurt long-context EXTENSION and compound (up to -47% downstream when 3+ are
+    combined). The damage is invisible in short-context val loss. For Quark: a planner soft rule
+    for the long-context purpose profile. Penalize stacking GQA + SWA + short train ctx when
+    YaRN/DaRoPE extension is planned.
+
+E5. [NOTE] Selecting Repetition Counts in Data-Constrained Pretraining 2610.05126
+    The best number of epochs over a target corpus changes with model size (16 -> 8 repeats
+    was better at 520M). Use small proxy runs to shortlist epoch counts. Fits the planner's
+    multi-epoch warning (pair with A8 MIR).
+
+Reviewed and SKIPPED:
+  - Parallax 2605.29157 (local-linear attention): gains at 0.6B/1.7B, and it pairs well with
+    Muon, but it needs a custom kernel to be efficient. A non-starter on T4 and Windows for now.
+  - GAPE 2605.10414 (gated adaptive PE): long-context extrapolation. DaRoPE already covers
+    that need in this project.
+  - Attention sinks unified view 2606.08105: analysis on vision transformers. E2 is the
+    actionable version.
+  - Self-Pruned KV attention 2605.14037, BF1 sparse attention, Nexusformer, TinyCeNN: KV/serving
+    or model-growth topics, not small-model quality.
+  - Small LLMs: Pruning vs. Training from Scratch 2606.14150: prunes Llama-3.1-8B, which
+    needs hardware we don't have.
+
+=====================================================================================
+SECTION F - HYBRIDS, FFN ALLOCATION, TOKENIZATION, DISTILLATION, MULTI-EPOCH
+=====================================================================================
+F1. [TRY - free param reallocation] Geometry-Guided Layerwise FFN Width Allocation
+    arXiv 2608.02064 (2026-08-03) - Mudarisov, Burtsev, State
+    What: Instead of a constant FFN width, allocate the SAME total FFN params unevenly across
+      depth. The geometry-based ("normalized work") schedules are FRONT-LOADED (wider FFNs in
+      early layers). In PAIRED 128M and 256M training runs, they lower mean val loss vs uniform
+      AND vs a hand-made cosine taper. The gap grows at 440M.
+    Cost: zero at train time (same params and FLOPs). The schedule can be measured once on a
+      small pilot model, or just use a fixed front-loaded taper as the default.
+    For Quark: a planner/shape option `ffn_width_schedule: uniform|front_loaded|measured`.
+      Easy ablation. Note the interaction with B2: in a looped model the shared middle block
+      has one width, so allocation applies to the begin/end blocks.
+
+F2. [NOTE - later, toolchain permitting] Hybrid linear-attention models
+    - Olmo Hybrid 2604.03444 (AI2, 7B): replacing sliding-window layers with Gated DeltaNet
+      layers beat Olmo 3 and SCALES MORE EFFICIENTLY than the transformer. That's the strongest
+      controlled evidence so far that hybrids are better per FLOP in pretraining, not just at
+      inference.
+    - Head-wise Hybrid (HwH) 2609.02986: NoPE full-attention heads for global retrieval plus
+      linear-attention heads for local/positional work, at FA:LA < 1:3. Better retrieval and
+      length extrapolation. It conceptually overlaps with DaRoPE (slow RoPE bands are the
+      problem).
+    Why not now: Gated DeltaNet needs Triton kernels (flash-linear-attention). Those are painful
+      on native Windows and fp16/T4 support is uncertain, and a pure-PyTorch recurrence is too
+      slow. Revisit if we move local training to WSL2 and confirm fla works on T4.
+    Skipped: TALH small MLA-SSM hybrid 2609.29618 (single seed, unmatched params, author says
+      no general conclusions).
+
+F3. [TRY - distillation that fits our hardware] Strong Teacher Not Needed? Distillation in LLM pretraining
+    arXiv 2605.23857 (2026-05-22) - Taiming Lu, Zhuang Liu
+    Finding: with the right mix of LM loss + KD loss, even SMALL, UNDERTRAINED teachers improve
+      students (including larger ones). Stronger teachers can saturate or REVERSE the gains. KD
+      helps generalization (OOD + downstream) more than in-domain loss.
+    Why it matters: our "needs a huge teacher" kill criterion doesn't apply. A same-tokenizer
+      ~100-350M open model (e.g. SmolLM2-135M/360M with its 49k tokenizer) can run as a teacher
+      in fp16 next to the student on 8 GB. Or cache the teacher's top-k logits to disk once
+      and reuse them across epochs.
+    Caveats: no HTML full text, so I couldn't verify sizes or the mixing ratio. JugnuLM (D2)
+      found KD from a 1.7B teacher raised perplexity, consistent with "stronger isn't better".
+    Also: "Divergence controls entropy in distillation" 2610.03529. Forward KL inflates student
+      entropy; reverse KL deflates it. Use forward KL + CE mixing (the standard) and watch
+      sample sharpness.
+    For Quark: train/kd.py with options (teacher path, alpha, top-k cache). The tokenizer must
+      match the teacher's.
+
+F4. [NOTE] q0: Primitives for Hyper-Epoch Pretraining 2606.03938
+    For heavily repeated small datasets: a cyclic LR with anti-correlated WD collects diverse
+    snapshots, "chain distillation" trains each snapshot against its predecessor, and a learned
+    ensemble prior combines them. 1.8B on 100M tokens matched a 256-epoch ensemble in ~56
+    epochs. It yields an ENSEMBLE (more inference cost). Chain distillation alone is the piece
+    worth borrowing for TinyStories-style many-epoch runs.
+
+F5. [NOTE] Looped GPT-BERT (BabyLM 2026 strict-small) 2609.09691
+    A 12.18M model (4 physical layers x 12 loops) on 7.5M words matches BabyLM GPT-2/GPT-BERT
+    10M-word baselines on BLiMP/GLUE with fewer params. This is more evidence that looping pays
+    off when DATA is the limit. Too few physical layers limits some tasks. The planner should
+    favor looping for small/repeated datasets.
+
+F6. [NOTE] Tokenization
+    - CoBPE 2610.05597 (COLM 2026): compositional tokens (base word + surface modifiers),
+      sequences 30% shorter, +1.2 downstream at matched compute, tested at 780M/1.3B. It's a
+      new tokenizer plus a joint output head, a big build. Revisit after core components.
+    - Byte-level simulation 2604.27263: subword wins mostly through THROUGHPUT (more text per
+      step) plus boundary priors. Supports the plan's advice to use a small custom BPE (4-8k) for
+      tiny models: still subword, smaller embedding/logit cost.
+
+F7. [NOTE] GQA-muP 2605.15290: muP / Complete-P scalings derived for GQA, so LR transfers
+    across GQA group counts and depth/WD settings. Use it if the planner does muP-style transfer
+    from a tiny tuning proxy. Overlaps with Hyperball's (A6) LR-transfer benefit.
+
+Reviewed and SKIPPED:
+  - Wiola 2607.01394: "novel" 5-component SLM architecture with no training results (only
+    "unit tests pass"). No evidence.
+  - KANs for SLMs 2607.15525: the authors' own results show no consistent gain over SwiGLU.
+  - OASIS 2604.09406: activation-subspace memory saving (2x peak memory). Gradient
+    checkpointing + chunked CE is simpler for our model sizes.
+  - Complexity-guided init 2607.09204: a negative result (spectral-matched init didn't help).
+
+=====================================================================================
+SECTION G - REMAINING NOTES & SKIPS
+=====================================================================================
+G1. [NOTE - needed if B2 is used] DeepLoop: Depth Scaling for Looped Transformers 2607.13491
+    (Li, Zhang, Guo, Quanquan Gu). Residual scaling for looped models must count parameter
+    VISITS, not physical layers: DeepNorm-style alpha = (2N)^1/2, beta = (8N)^-1/2 with N =
+    unrolled depth. Neutral without loops, better val loss with loops (GPT-2 small/medium).
+    It's Post-LN. For our Pre-Norm + LayerRoPE stack, the takeaway is to init/scale the shared
+    middle block by UNROLLED depth (e.g. GPT-2-style out-proj init std / sqrt(2*N_unrolled)).
+
+G2. [NOTE - capacity add-on, conflicts with the "small model" goal] Engram / n-gram memory
+    FactorEngram 2609.35578 (340M/1B gains), Tensorized Engram 2606.08347 (fewer params than
+    Engram), Memory Grafting 2605.20948 (offline teacher hidden states as n-gram memory).
+    Lookup tables add params cheaply in FLOPs and could even live in CPU RAM, but they make the
+    model BIGGER on disk, and Forking (D4) shows they overfit sharply under repeated data. Skip
+    unless the purpose is "max quality, size doesn't matter".
+
+G3. [SKIP] Do Transformers Need Three Projections? (ICML 2026) 2606.04032
+    Shared K=V cuts the KV cache by 50% but costs ~3.1% perplexity at 300M/1.2B. That's an
+    inference-memory trade, and we want quality per param.
+
+G4. [SKIP] Fixed (non-trainable) input token codes 2610.04002 / 2605.09751: viable, but worse
+    than a learned table (single runs, 1.7B). Same untied-head problem as Kronecker (C5).
+
+G5. [SKIP] X-MoD 2609.34212 (sparse-depth routing): grows total params at fixed active compute,
+    the opposite of our goal. LEAP / early-exit pretraining: inference speed.
+
+=====================================================================================
+END OF SWEEP. Coverage: optimizers/schedules, looped & fixed-point models, residual/norm,
+embeddings, MTP, attention gating/sinks, hybrids, FFN allocation, tokenization,
+distillation, multi-epoch/data, small-scale planner calibration.
+Not covered in depth (low expected value for us): MoE, long-context serving, FP4/FP8
+(no hardware support on 3070 Ti/T4), RL post-training, multimodal.
+=====================================================================================
