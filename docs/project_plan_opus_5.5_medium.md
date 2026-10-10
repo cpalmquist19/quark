@@ -595,6 +595,8 @@ The models Phase 2b selects components for are aimed at this target. TinyStories
 
 ### 18.1 Data sources (first survey, 2026-10-10)
 
+Measured supply and quality: [domain_data_survey.md](domain_data_survey.md). In FineWeb-Edu, documents *about* each domain are ~0.74% (neurodivergence), ~4.5% (education) and ~0.86% (early childhood) of tokens, mostly adult-facing. Cosmopedia's young-children text is child-voiced retellings of older topics, not pre-K content.
+
 | Domain | Source | Status |
 |---|---|---|
 | General English | `HuggingFaceFW/fineweb-edu` | Planned base |
