@@ -1,6 +1,7 @@
 """`quark` command-line entry point.
 
-Available: version, gpu detect|list, components list|show, new, data prepare, train, generate. The rest of plan §13
+Available: version, gpu detect|list, components list|show, compare check|run|report, new, data prepare, train,
+generate. The rest of plan §13
 (plan, build, notebook, compare, export, models) arrives in later phases.
 """
 
@@ -24,6 +25,8 @@ data_app = typer.Typer(help="Prepare datasets.", no_args_is_help=True)
 app.add_typer(data_app, name="data")
 components_app = typer.Typer(help="Browse the component registry.", no_args_is_help=True)
 app.add_typer(components_app, name="components")
+compare_app = typer.Typer(help="Paired-seed comparisons of components.", no_args_is_help=True)
+app.add_typer(compare_app, name="compare")
 
 # Windows consoles may use a legacy code page (e.g. cp1252); never crash on an unprintable character.
 for _stream in (sys.stdout, sys.stderr):
@@ -143,10 +146,76 @@ def components_show(key: str = typer.Argument(..., help="slot:name, e.g. positio
     console.print(table)
 
 
+def _load_spec(spec: Path):
+    from pydantic import ValidationError
+
+    from quark.compare import CompareSpec
+
+    try:
+        return CompareSpec.from_yaml(spec)
+    except (OSError, ValidationError) as err:
+        console.print(f"[red]{spec}: {err}[/red]")
+        raise typer.Exit(1) from err
+
+
+@compare_app.command("check")
+def compare_check(spec: Path = typer.Argument(..., help="Compare spec (YAML).")) -> None:
+    """Validate every arm and show its size, without training."""
+    from quark.compare import arm_config, validate
+    from quark.components import ComponentError
+    from quark.model import count_params
+
+    s = _load_spec(spec)
+    try:
+        issues = validate(s)
+    except ComponentError as err:
+        console.print(f"[red]{err}[/red]")
+        raise typer.Exit(1) from err
+    table = Table(title=f"compare {s.name}: {len(s.arms)} arms x {len(s.seeds)} seeds = {len(s.arms) * len(s.seeds)} runs")
+    for column in ("arm", "params", "tokens", "notes"):
+        table.add_column(column)
+    for arm in s.arms:
+        cfg = arm_config(s, arm, s.seeds[0])
+        notes = "; ".join(f"{i.severity}: {i.message}" for i in issues[arm]) or "-"
+        label = arm + (" (reference)" if arm == s.ref else "")
+        table.add_row(label, f"{count_params(cfg.model) / 1e6:.2f}M", f"{cfg.train.max_tokens / 1e6:,.0f}M", notes)
+    console.print(table)
+
+
+@compare_app.command("run")
+def compare_run(
+    spec: Path = typer.Argument(..., help="Compare spec (YAML)."),
+    data: Path = typer.Option(..., help="Prepared data folder (see `quark data prepare`)."),
+    out: Path | None = typer.Option(None, help="Output folder (default: experiments/<name>)."),
+) -> None:
+    """Run or continue a compare; finished runs are skipped, interrupted ones resume."""
+    from quark.compare import run_compare
+    from quark.components import ComponentError
+
+    s = _load_spec(spec)
+    try:
+        summary = run_compare(s, data, out)
+    except ComponentError as err:
+        console.print(f"[red]{err}[/red]")
+        raise typer.Exit(1) from err
+    console.print(f"{summary['runs_done']}/{summary['runs_total']} runs done. Report: {(out or Path('experiments') / s.name) / 'report.md'}")
+
+
+@compare_app.command("report")
+def compare_report(folder: Path = typer.Argument(..., help="A compare's output folder (with spec.yaml).")) -> None:
+    """Rebuild and print a compare's report from its finished runs."""
+    from rich.markdown import Markdown
+
+    from quark.compare import CompareSpec, write_report
+
+    write_report(CompareSpec.from_yaml(folder / "spec.yaml"), folder)
+    console.print(Markdown((folder / "report.md").read_text(encoding="utf-8")))
+
+
 @app.command()
 def new(
     name: str = typer.Argument(..., help="Model name; creates models/<name>/config.yaml."),
-    preset: str = typer.Option("tinystories-small", help="Starting config: smoke | tinystories-small."),
+    preset: str = typer.Option("tinystories-small", help="Starting config: smoke | tinystories-small | ablation-s | ablation-m."),
     force: bool = typer.Option(False, "--force", help="Overwrite an existing config.yaml."),
 ) -> None:
     """Create a model folder from a preset config."""

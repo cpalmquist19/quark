@@ -170,6 +170,8 @@ New hooks: `PositionEncoding.attn_bias`, `Head.loss` and `mark_fused`.
 
 Measured on the 3070 Ti at `tinystories-small` size (fp16, 32k tokens/step): Muon takes 335 ms/step against AdamW's 294 ms (+14%), with the same peak memory. Expect more on the T4, where Newton–Schulz runs in fp32. Batching same-shape matrices through Newton–Schulz would cut this if it matters.
 
+At `ablation-s` (seq_len 2048) ALiBi costs roughly +20% per step: its float bias mask rules out SDPA's fastest causal path, and the bias is rebuilt in every layer. Caching it per forward pass is a cheap fix if ALiBi survives the ablations. (Local laptop timings vary up to 5× with the GPU's power state, so treat these as rough; the compare runs on the T4 measure speed properly.)
+
 **Invariants kept:**
 - state-dict keys are unchanged (`blocks.0.attn.qkv.weight` …), so existing checkpoints load;
 - the same seed gives bit-identical init to the pre-registry model, so earlier baselines stay comparable;

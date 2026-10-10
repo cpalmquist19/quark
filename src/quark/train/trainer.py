@@ -108,6 +108,7 @@ class Trainer:
         self.spikes = SpikeDetector(self.tcfg.divergence.spike_sigma, self.tcfg.divergence.window)
         self.last_val: float | None = None
         self._display = None
+        self._fit_started: float | None = None  # wall-clock start of the current fit(), for eval timestamps
 
         session = self.hardware.session if self.hardware else None
         self.checkpoint_every_min = self.tcfg.checkpoint_every_min or (session.checkpoint_every_min if session else None)
@@ -174,7 +175,7 @@ class Trainer:
         t = self.tcfg
         self.log(self._banner())
         self.model.train()
-        started = last_ckpt = time.time()
+        started = last_ckpt = self._fit_started = time.time()
         window = self._new_window()
         last_eval_step = -1
         stop_reason = "completed"
@@ -228,6 +229,7 @@ class Trainer:
             stop_reason = "interrupted"
         finally:
             self.train_time_s += time.time() - started
+            self._fit_started = None
 
         if stop_reason != "diverged" and last_eval_step != self.step:
             self._evaluate_and_check(final=True)
@@ -298,6 +300,7 @@ class Trainer:
                 "train_loss_ema": self.loss_ema,
                 "best_val": self.stopper.best,
                 "epoch": epoch,
+                "time_s": self.train_time_s + (time.time() - self._fit_started if self._fit_started else 0.0),
             }
         )
         self.log(

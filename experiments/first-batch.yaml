@@ -1,0 +1,32 @@
+# First component comparison on the ablation-s rung (plan §18.2).
+#   quark compare check experiments/first-batch.yaml
+#   quark compare run experiments/first-batch.yaml --data <prepared data folder>
+# On Colab, use notebooks/quark_compare_colab.ipynb.
+#
+# Each arm overrides the base config; {} is the base itself. All arms train once per seed on the same
+# token budget, and every arm is compared with the reference (the first arm unless `reference` is set).
+# Arms take ~10-12 min each on a T4 at ablation-s (estimate): 8 arms x 2 seeds is roughly 3 hours.
+
+name: first-batch
+base: ablation-s
+seeds: [1, 2]
+# What every arm trains on (DataConfig fields). TinyStories until the target mix exists (plan §18.2).
+data:
+  source: roneneldan/TinyStories
+  tokenizer: {type: train, size: 8192}
+arms:
+  baseline: {}                                   # RoPE, MHA, RMSNorm, SwiGLU, tied head, AdamW, cosine
+  muon:
+    train: {optimizer: muon}
+  muon-lr-half:                                  # Muon gets its own small LR sweep (plan §18.2)
+    train: {optimizer: muon, lr: 1.1e-3}
+  wsd:
+    train: {schedule: wsd}
+  qk-norm:
+    model: {toggles: {qk_norm: true}}
+  z-loss:
+    model: {toggles: {z_loss: true}}
+  alibi:
+    model: {slots: {position: alibi}}
+  relu2:
+    model: {slots: {mlp: relu2}}

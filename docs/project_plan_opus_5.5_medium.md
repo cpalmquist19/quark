@@ -504,7 +504,7 @@ Optimizer implementations (Muon, etc.) are vendored as small, readable files wit
 - ✅ QK-norm, ALiBi/NoPE, ReLU², WSD, Muon, z-loss (2026-10-10; see [component_registry.md §9](component_registry.md)).
 - Still to add: DaRoPE, grad checkpointing, 8-bit AdamW.
 - ✅ Per-component contract tests (shapes, causality, KV cache, overfit, param count) for every registered component.
-- `quark compare`: baseline + arms × **paired seeds** (≥2–3), equal token budget, report with paired deltas, speed and an equal-time estimate. At this scale seed noise is the same size as many of the effects (E2 measured gains of 0.005–0.02 nats). Ablation ladder presets `ablation-s` (~10M) and `ablation-m` (~40M) at seq_len 2048 (§18.2).
+- ✅ (2026-10-10) `quark compare`: baseline + arms × **paired seeds** (≥2–3), equal token budget, report with paired deltas, speed and an equal-time estimate. At this scale seed noise is the same size as many of the effects (E2 measured gains of 0.005–0.02 nats). Ablation ladder presets `ablation-s` (8.5M, 40M tokens) and `ablation-m` (38M, 200M tokens) at seq_len 2048 (§18.2). Runs seed by seed, skips finished runs, resumes unfinished ones and respects the Colab session limit; `notebooks/quark_compare_colab.ipynb` runs it on Colab. Spec format: `experiments/first-batch.yaml`.
 - **Data mixtures** (added for §18): several sources with weights and filters (audience, topic, keyword), a validation split per source, and per-domain val loss in the trainer, plots and compare reports.
 - First experiments on the target mix: domain weights, then the component arms.
 

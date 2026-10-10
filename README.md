@@ -99,12 +99,34 @@ Invalid combinations fail before training starts, with the reason (for example
 `unknown position 'ropee'; did you mean 'rope'?` or `requires attention:mha`). Grouped-query attention is
 `model.n_kv_heads`, not a component.
 
+## Compare components
+
+`quark compare` decides whether a component helps. A spec (see
+[experiments/first-batch.yaml](experiments/first-batch.yaml)) names a base config, **arms** (each a partial
+override, `{}` = the base) and **seeds**. Every arm trains once per seed on the same token budget; paired seeds
+share data order and initial weights, so per-seed differences cancel most run-to-run noise.
+
+- **On Colab:** open [notebooks/quark_compare_colab.ipynb](notebooks/quark_compare_colab.ipynb), edit the spec in
+  its Settings cell, *Run all*. Results go to `MyDrive/quark/experiments/<name>/`. If the session ends, *Run all*
+  again: finished runs are skipped and an unfinished one resumes. It stops by itself ~20 minutes before
+  Colab's 12-hour limit.
+- **Locally:** `uv run quark compare check experiments/first-batch.yaml`, then
+  `uv run quark compare run experiments/first-batch.yaml --data <prepared data folder>`.
+- **The report** (`report.md`, `curves.png`, `results.json`) gives, per arm: the paired Δ in final val loss vs
+  the reference (± standard error), how many seeds agree, an estimated Δ at equal wall-clock time, speed, peak
+  memory and a verdict (*better* / *worse* / *within noise*). The curves show whether a gap was still widening.
+- **Ladder presets:** `ablation-s` (~8.5M params, 40M tokens, seq_len 2048) for every component; `ablation-m`
+  (~38M, 200M tokens) for finalists. Why a ladder, and which results transfer to the target model: plan §18.2.
+- Checkpoints of finished runs are deleted to save Drive space (`keep_checkpoints: true` keeps them); the
+  metrics stay.
+
 ## Commands
 
 ```
 quark version | gpu detect [--save] | gpu list
 quark components list [<slot>] | components show <slot:name>
-quark new <name> [--preset smoke|tinystories-small]
+quark compare check <spec.yaml> | compare run <spec.yaml> --data <dir> | compare report <experiment dir>
+quark new <name> [--preset smoke|tinystories-small|ablation-s|ablation-m]
 quark data prepare [--source ...] [--tokenizer train:8192|pretrained:smollm2] [--max-docs N]
 quark train <model> --data <dir> | --resume latest|best|<path> [--max-steps N]
 quark generate <model> [--ckpt best|latest|<path>] [--prompt ...] [--samples N] [--temperature ...]
@@ -118,5 +140,6 @@ quark generate <model> [--ckpt best|latest|<path>] [--prompt ...] [--samples N] 
 - Phase 1 (baseline GPT, data, trainer, generation, notebooks): done, exit criteria met on Colab (val loss 1.48, resume from Drive verified).
 - Phase 2: component registry done ([design](docs/component_registry.md)); the baseline is now built from registered components.
 - First add-ons done: Muon, WSD, QK-norm, z-loss, ALiBi, NoPE, ReLU² (`quark components list`).
-- Next: `quark compare` (paired-seed ablations) with the `ablation-s` / `ablation-m` ladder, then data
-  mixtures with per-domain validation, then the first experiments on the target mix.
+- `quark compare` (paired-seed ablations), the `ablation-s` / `ablation-m` ladder presets and the Colab compare
+  notebook: done.
+- Next: data mixtures with per-domain validation, then the first experiments on the target mix.
