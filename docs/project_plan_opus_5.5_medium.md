@@ -496,7 +496,8 @@ Optimizer implementations (Muon, etc.) are vendored as small, readable files wit
 
 **Phase 2: Registry + first addons**
 - ✅ Component base class, slots, `@register`, metadata, rules; baseline refactored into components (2026-10-10). Design and decisions: [component_registry.md](component_registry.md). GQA/MQA are the `n_kv_heads` shape dimension rather than separate components.
-- Add GQA/MQA, QK-norm, ALiBi/NoPE, DaRoPE, ReLU², WSD, Muon, z-loss, grad checkpointing, 8-bit AdamW.
+- ✅ QK-norm, ALiBi/NoPE, ReLU², WSD, Muon, z-loss (2026-10-10; see [component_registry.md §9](component_registry.md)).
+- Still to add: DaRoPE, grad checkpointing, 8-bit AdamW.
 - Per-component unit + overfit tests; ablation recipe (`quark compare`). Ablations use **paired seeds** (≥2–3). At this scale seed noise is the same size as many of the effects (E2 measured gains of 0.005–0.02 nats).
 
 **Phase 2b: Parameter-efficiency stack (the project's north star)**

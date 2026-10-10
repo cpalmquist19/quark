@@ -11,7 +11,6 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from quark.components import KVCache, build_context
 from quark.config import HardwareProfile, ModelConfig
@@ -48,16 +47,15 @@ class GPT(nn.Module):
         targets: torch.Tensor | None = None,
         cache: KVCache | None = None,
     ) -> torch.Tensor:
-        """Returns the mean cross-entropy loss if `targets` is given, else logits (B, T, vocab)."""
+        """Returns the training loss if `targets` is given (plain cross-entropy in eval mode), else
+        logits (B, T, vocab)."""
         start = cache.length if cache is not None else 0
         if start + idx.shape[1] > self.cfg.seq_len:
             raise ValueError(f"sequence length {start + idx.shape[1]} exceeds seq_len {self.cfg.seq_len}")
         x = self.pos.embed(self.tok_emb(idx), start)
         x = self.blocks(x, self.pos, cache)
         logits = self.head(self.norm(x), self.tok_emb)
-        if targets is None:
-            return logits
-        return F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), targets.reshape(-1), ignore_index=-1)
+        return logits if targets is None else self.head.loss(logits, targets)
 
     def num_params(self, non_embedding: bool = False) -> int:
         n = sum(p.numel() for p in self.parameters())

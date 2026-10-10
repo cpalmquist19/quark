@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from quark.components.registry import TOGGLE, Component, ComponentParams, define_slot
 
@@ -70,6 +71,17 @@ def mark_residual(linear: nn.Linear) -> nn.Linear:
     return linear
 
 
+def mark_fused(linear: nn.Linear, sizes: list[int]) -> nn.Linear:
+    """Flag a weight that stacks several matrices along its output dim (e.g. q, k, v).
+
+    Matrix-aware optimizers such as Muon treat each part as its own matrix.
+    """
+    if sum(sizes) != linear.out_features:
+        raise ValueError(f"fused sizes {sizes} don't add up to out_features {linear.out_features}")
+    linear._quark_fused = list(sizes)
+    return linear
+
+
 # --- model slots --------------------------------------------------------------------------------
 
 
@@ -83,6 +95,11 @@ class PositionEncoding(Component, nn.Module):
     def rotate(self, q: torch.Tensor, k: torch.Tensor, start: int) -> tuple[torch.Tensor, torch.Tensor]:
         """q, k: (B, heads, T, head_dim); `start` is the absolute position of the first token."""
         return q, k
+
+    def attn_bias(self, tq: int, tk: int, start: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor | None:
+        """Additive attention-score bias (n_heads, tq, tk) for queries at start..start+tq-1 and
+        keys at 0..tk-1, or None. Attention components that apply it must say so in `requires`."""
+        return None
 
 
 class Attention(Component, nn.Module):
@@ -111,10 +128,22 @@ class Stack(Component, nn.Module):
 
 
 class Head(Component, nn.Module):
-    """forward(hidden, embedding) -> logits (B, T, vocab)."""
+    """forward(hidden, embedding) -> logits (B, T, vocab); loss(logits, targets) -> scalar."""
+
+    z_loss_coef = 0.0  # set by heads that implement the z_loss toggle
 
     def forward(self, x: torch.Tensor, embedding: nn.Embedding) -> torch.Tensor:
         raise NotImplementedError
+
+    def loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Mean cross-entropy (targets of -1 are ignored). Auxiliary terms such as z-loss are added
+        in training mode only, so validation loss stays plain cross-entropy and comparable."""
+        logits, targets = logits.float().reshape(-1, logits.shape[-1]), targets.reshape(-1)
+        loss = F.cross_entropy(logits, targets, ignore_index=-1)
+        if self.z_loss_coef and self.training:
+            keep = targets != -1
+            loss = loss + self.z_loss_coef * torch.logsumexp(logits[keep], dim=-1).square().mean()
+        return loss
 
 
 # --- train slots --------------------------------------------------------------------------------

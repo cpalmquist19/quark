@@ -1,3 +1,3 @@
-from quark.components.position import rope
+from quark.components.position import alibi, nope, rope
 
-__all__ = ["rope"]
+__all__ = ["alibi", "nope", "rope"]

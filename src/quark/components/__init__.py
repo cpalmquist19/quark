@@ -3,7 +3,7 @@
 Importing this package registers the built-in components.
 """
 
-from quark.components import attention, block, head, mlp, norm, optim, position, schedule  # noqa: F401  (registers)
+from quark.components import attention, block, head, mlp, norm, optim, position, schedule, toggles  # noqa: F401  (registers)
 from quark.components.base import (
     MLP,
     Attention,

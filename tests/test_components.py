@@ -1,7 +1,8 @@
 """Contract tests every registered component gets for free (docs/component_registry.md §7).
 
-Each model component is swapped into a tiny baseline config; combinations the registry rejects are
-skipped with the reason. A new component only needs tests for what is specific to it.
+Each model component is swapped into a tiny baseline config, and each model toggle is switched on
+in it; combinations the registry rejects are skipped with the reason. A new component only needs
+tests for what is specific to it.
 """
 
 import math
@@ -9,19 +10,27 @@ import math
 import pytest
 import torch
 
-from quark.components import TOGGLE, check, components, make_optimizer, make_schedule, names, slots
+from quark.components import TOGGLE, check, components, get, make_optimizer, make_schedule, names, slots
 from quark.config import ModelConfig, QuarkConfig, TrainConfig
 from quark.model import build_model, count_params
 
 VOCAB = 97
 BASE = ModelConfig(vocab_size=VOCAB, d_model=32, n_layers=2, n_heads=4, seq_len=24)
+MODEL_SLOTS = {spec.name for spec in slots("model")}
 MODEL_VARIANTS = [
     pytest.param(spec.name, name, id=f"{spec.name}:{name}") for spec in slots("model") for name in names(spec.name)
+] + [
+    pytest.param(TOGGLE, name, id=f"toggle:{name}")
+    for name in names(TOGGLE)
+    if get(TOGGLE, name).implemented_by in MODEL_SLOTS
 ]
 
 
 def config_with(slot: str, name: str) -> ModelConfig:
-    cfg = BASE.model_copy(update={"slots": {**BASE.slots, slot: name}})
+    if slot == TOGGLE:
+        cfg = BASE.model_copy(update={"toggles": {name: True}})
+    else:
+        cfg = BASE.model_copy(update={"slots": {**BASE.slots, slot: name}})
     errors = [i for i in check(QuarkConfig(model=cfg), stages=("model",)) if i.severity == "error"]
     if errors:
         pytest.skip(f"not valid with the baseline: {'; '.join(i.message for i in errors)}")

@@ -1,3 +1,3 @@
-from quark.components.schedule import cosine
+from quark.components.schedule import cosine, wsd
 
-__all__ = ["cosine"]
+__all__ = ["cosine", "wsd"]

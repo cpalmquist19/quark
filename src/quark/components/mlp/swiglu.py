@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from quark.components.base import MLP, BuildContext, mark_residual
+from quark.components.base import MLP, BuildContext, mark_fused, mark_residual
 from quark.components.registry import register
 
 
@@ -22,7 +22,7 @@ class SwiGLU(MLP):
         super().__init__()
         cfg = ctx.cfg
         self.hidden = 64 * math.ceil(cfg.ffn_mult * cfg.d_model / 64)  # multiple of 64 for efficient matmuls
-        self.gate_up = nn.Linear(cfg.d_model, 2 * self.hidden, bias=False)
+        self.gate_up = mark_fused(nn.Linear(cfg.d_model, 2 * self.hidden, bias=False), [self.hidden, self.hidden])
         self.down = mark_residual(nn.Linear(self.hidden, cfg.d_model, bias=False))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

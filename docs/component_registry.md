@@ -154,6 +154,22 @@ A new component therefore needs only its own specific tests. The generic contrac
 
 **Out (next steps, to discuss):** the actual add-ons (GQA as a planner dimension, QK-norm, ALiBi/NoPE, DaRoPE, ReLU², WSD, Muon, z-loss, grad checkpointing, 8-bit AdamW), `quark compare`, and the attention-bias hook for ALiBi. That hook gets added to `PositionEncoding` together with its first user, so it's tested from day one.
 
+## 9. First add-ons (2026-10-10)
+
+| Component | Notes |
+|---|---|
+| `toggle:qk_norm` | Implemented by `attention:mha`. Uses the model's norm type over `head_dim`, before the position encoding. |
+| `toggle:z_loss` | Implemented by `head:tied`. `coef` defaults to 1e-4 (PaLM). Added in training mode only, so validation loss stays plain cross-entropy and ablations stay comparable. |
+| `position:nope` | No position signal. |
+| `position:alibi` | Uses the new `PositionEncoding.attn_bias` hook; `requires attention:mha` (the attention type must apply the bias). The float mask means SDPA can't use `is_causal`. |
+| `mlp:relu2` | Hidden width is 1.5 × `ffn_mult` × `d_model`, so the parameter count matches SwiGLU at the same `ffn_mult`. |
+| `schedule:wsd` | `decay_frac` (0.2), `decay` (`linear` or `1-sqrt`). |
+| `optimizer:muon` | Muon for hidden matrices, AdamW for the embedding table and vectors, all in one optimizer and one state dict. Updates are scaled by 0.2·√max(rows, cols), so `lr` and `weight_decay` carry over from AdamW (Moonlight). Newton–Schulz runs in bf16 where native, otherwise in fp32 (T4). Fused weights marked with `mark_fused` (q/k/v, gate/up) are orthogonalized part by part. |
+
+New hooks: `PositionEncoding.attn_bias`, `Head.loss` and `mark_fused`.
+
+Measured on the 3070 Ti at `tinystories-small` size (fp16, 32k tokens/step): Muon takes 335 ms/step against AdamW's 294 ms (+14%), with the same peak memory. Expect more on the T4, where Newton–Schulz runs in fp32. Batching same-shape matrices through Newton–Schulz would cut this if it matters.
+
 **Invariants kept:**
 - state-dict keys are unchanged (`blocks.0.attn.qkv.weight` …), so existing checkpoints load;
 - the same seed gives bit-identical init to the pre-registry model, so earlier baselines stay comparable;
