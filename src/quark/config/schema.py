@@ -194,10 +194,16 @@ class TokenizerConfig(_Strict):
 
 class DataConfig(_Strict):
     source: str = "roneneldan/TinyStories"  # HF dataset name or a local file/folder
+    subset: str | None = None  # HF dataset config, e.g. "sample-10BT" for HuggingFaceFW/fineweb-edu
     split: str = "train"  # HF split to read; train/val are split by Quark (hash-based)
+    token_limit: int | None = Field(None, gt=0)  # stop after this many tokens; HF sources are then streamed
     text_field: str = "text"
     tokenizer: TokenizerConfig = Field(default_factory=TokenizerConfig)
     val_fraction: float = Field(0.005, gt=0, lt=0.5)
+
+
+# Fields added after configs were already in use: config_hash() skips them while unset.
+HASH_OMIT_IF_DEFAULT = (("model", "params"), ("train", "params"), ("data", "subset"), ("data", "token_limit"))
 
 
 class QuarkConfig(_Strict):
@@ -212,15 +218,15 @@ class QuarkConfig(_Strict):
 
         `name` and `hardware` are excluded on purpose: checkpoints are portable across GPUs. So are
         runtime settings such as logging cadence and early stopping (RUNTIME_TRAIN_FIELDS).
-        Component `params` are left out while empty, so configs written before they existed keep
-        their hash and their runs can still resume.
+        Fields added after Phase 1 are left out while unset (HASH_OMIT_IF_DEFAULT), so configs written
+        before they existed keep their hash and their runs can still resume.
         """
         payload = self.model_dump(include={"model", "train", "data"}, mode="json")
         for field in RUNTIME_TRAIN_FIELDS:
             payload["train"].pop(field, None)
-        for section in ("model", "train"):
-            if not payload[section]["params"]:
-                del payload[section]["params"]
+        for section, field in HASH_OMIT_IF_DEFAULT:
+            if payload[section][field] in (None, {}):
+                del payload[section][field]
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode()).hexdigest()[:12]
 

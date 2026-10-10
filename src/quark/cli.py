@@ -234,6 +234,8 @@ def new(
 @data_app.command("prepare")
 def data_prepare(
     source: str = typer.Option("roneneldan/TinyStories", help="Hugging Face dataset name, or a local file/folder."),
+    subset: str | None = typer.Option(None, help="Hugging Face dataset config, e.g. sample-10BT for fineweb-edu."),
+    token_limit: int | None = typer.Option(None, help="Stop after this many tokens (streams Hugging Face sources)."),
     out: Path | None = typer.Option(None, help="Output folder (default: data/<source>-<tokenizer>)."),
     tokenizer: str = typer.Option("train:8192", help="train:<vocab size> or pretrained:<name> (e.g. smollm2)."),
     split: str = typer.Option("train", help="Hugging Face split to read."),
@@ -256,7 +258,10 @@ def data_prepare(
     else:
         console.print("[red]--tokenizer must look like train:8192 or pretrained:smollm2[/red]")
         raise typer.Exit(1)
-    data = DataConfig(source=source, split=split, text_field=text_field, tokenizer=tok, val_fraction=val_fraction)
+    data = DataConfig(
+        source=source, subset=subset, split=split, text_field=text_field, tokenizer=tok, val_fraction=val_fraction,
+        token_limit=token_limit,
+    )
     out = out or default_data_dir(data)
 
     with Progress(SpinnerColumn("line"), TextColumn("{task.description}"), TimeElapsedColumn(), console=console) as bar:

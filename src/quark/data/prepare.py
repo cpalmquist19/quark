@@ -26,6 +26,7 @@ from quark.data.sources import iter_documents
 from quark.data.tokenizer import build_tokenizer, eot_id
 
 BATCH_DOCS = 1000
+TOKENIZER_SAMPLE_CHARS = 250_000_000  # caps BPE training memory on long-document sources
 
 
 def is_val(text: str, val_fraction: float) -> bool:
@@ -47,10 +48,12 @@ def prepare_dataset(
     started = time.time()
 
     def docs(limit: int | None = max_docs):
-        return iter_documents(data.source, data.split, data.text_field, limit)
+        return iter_documents(
+            data.source, data.split, data.text_field, limit, subset=data.subset, streaming=data.token_limit is not None
+        )
 
     sample = tokenizer_sample_docs if max_docs is None else min(tokenizer_sample_docs, max_docs)
-    tok = build_tokenizer(data.tokenizer, docs(sample))
+    tok = build_tokenizer(data.tokenizer, _char_capped(docs(sample), TOKENIZER_SAMPLE_CHARS))
     tok.save(str(out / "tokenizer.json"))
     vocab_size = tok.get_vocab_size()
     eot = eot_id(tok)
@@ -69,6 +72,8 @@ def prepare_dataset(
                 counts[split][1] += len(ids)
             if progress is not None:
                 progress(counts["train"][0] + counts["val"][0], counts["train"][1] + counts["val"][1])
+            if data.token_limit is not None and counts["train"][1] + counts["val"][1] >= data.token_limit:
+                break
     finally:
         for fh in files.values():
             fh.close()
@@ -80,7 +85,9 @@ def prepare_dataset(
 
     meta = {
         "source": data.source,
+        "subset": data.subset,
         "split": data.split,
+        "token_limit": data.token_limit,
         "text_field": data.text_field,
         "tokenizer": data.tokenizer.model_dump(),
         "vocab_size": vocab_size,
@@ -100,6 +107,28 @@ def prepare_dataset(
 
 
 def default_data_dir(data: DataConfig, root: str | Path = "data") -> Path:
-    """e.g. data/tinystories-bpe8192 for roneneldan/TinyStories with the default tokenizer."""
-    stem = Path(data.source.rstrip("/\\")).name.lower().replace(" ", "-") or "data"
-    return Path(root) / f"{stem}-{data.tokenizer.tag()}"
+    """e.g. data/tinystories-bpe8192 for roneneldan/TinyStories with the default tokenizer, or
+    data/fineweb-edu-sample-10bt-500m-bpe8192 with subset "sample-10BT" and token_limit 500M."""
+    parts = [Path(data.source.rstrip("/\\")).name or "data"]
+    if data.subset:
+        parts.append(data.subset)
+    if data.token_limit:
+        parts.append(_short_count(data.token_limit))
+    parts.append(data.tokenizer.tag())
+    return Path(root) / "-".join(parts).lower().replace(" ", "-")
+
+
+def _short_count(n: int) -> str:
+    for scale, suffix in ((10**9, "b"), (10**6, "m"), (10**3, "k")):
+        if n >= scale and n % scale == 0:
+            return f"{n // scale}{suffix}"
+    return str(n)
+
+
+def _char_capped(texts, max_chars: int):
+    total = 0
+    for text in texts:
+        yield text
+        total += len(text)
+        if total >= max_chars:
+            return

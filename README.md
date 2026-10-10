@@ -115,6 +115,9 @@ share data order and initial weights, so per-seed differences cancel most run-to
 - **The report** (`report.md`, `curves.png`, `results.json`) gives, per arm: the paired Δ in final val loss vs
   the reference (± standard error), how many seeds agree, an estimated Δ at equal wall-clock time, speed, peak
   memory and a verdict (*better* / *worse* / *within noise*). The curves show whether a gap was still widening.
+- **Data:** the spec's `data` block is what every arm trains on. `first-batch` uses FineWeb-Edu (`subset: sample-10BT`,
+  `token_limit: 500000000`): with a token limit, Hugging Face datasets are streamed, so only ~2 GB is downloaded.
+  It's prepared once and cached on Drive for every later experiment.
 - **Ladder presets:** `ablation-s` (~8.5M params, 40M tokens, seq_len 2048) for every component; `ablation-m`
   (~38M, 200M tokens) for finalists. Why a ladder, and which results transfer to the target model: plan §18.2.
 - Checkpoints of finished runs are deleted to save Drive space (`keep_checkpoints: true` keeps them); the
@@ -127,7 +130,7 @@ quark version | gpu detect [--save] | gpu list
 quark components list [<slot>] | components show <slot:name>
 quark compare check <spec.yaml> | compare run <spec.yaml> --data <dir> | compare report <experiment dir>
 quark new <name> [--preset smoke|tinystories-small|ablation-s|ablation-m]
-quark data prepare [--source ...] [--tokenizer train:8192|pretrained:smollm2] [--max-docs N]
+quark data prepare [--source ...] [--subset ...] [--token-limit N] [--tokenizer train:8192|pretrained:smollm2] [--max-docs N]
 quark train <model> --data <dir> | --resume latest|best|<path> [--max-steps N]
 quark generate <model> [--ckpt best|latest|<path>] [--prompt ...] [--samples N] [--temperature ...]
 ```

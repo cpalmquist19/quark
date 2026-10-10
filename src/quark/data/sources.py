@@ -4,7 +4,9 @@ Local sources: a file or a folder (searched recursively) of
   - .txt      one document per file, or several separated by <|endoftext|>
   - .jsonl    one JSON object per line, text in `text_field`
   - .parquet  text in column `text_field`
-Anything else is treated as a Hugging Face dataset name.
+Anything else is treated as a Hugging Face dataset name (optionally a `subset`, i.e. its config).
+With `streaming`, a Hugging Face dataset is read as it downloads, so a capped read of a huge
+dataset (FineWeb-Edu is ~1.3T tokens) fetches only what it uses.
 """
 
 from __future__ import annotations
@@ -22,8 +24,13 @@ def iter_documents(
     split: str = "train",
     text_field: str = "text",
     max_docs: int | None = None,
+    subset: str | None = None,
+    streaming: bool = False,
 ) -> Iterator[str]:
-    docs = _iter_local(Path(source), text_field) if Path(source).exists() else _iter_hf(source, split, text_field)
+    if Path(source).exists():
+        docs = _iter_local(Path(source), text_field)
+    else:
+        docs = _iter_hf(source, split, text_field, subset, streaming)
     for count, doc in enumerate(docs):
         if max_docs is not None and count >= max_docs:
             return
@@ -54,9 +61,9 @@ def _iter_local(path: Path, text_field: str) -> Iterator[str]:
             raise ValueError(f"unsupported file type: {file}")
 
 
-def _iter_hf(name: str, split: str, text_field: str) -> Iterator[str]:
+def _iter_hf(name: str, split: str, text_field: str, subset: str | None, streaming: bool) -> Iterator[str]:
     from datasets import load_dataset
 
-    dataset = load_dataset(name, split=split)
+    dataset = load_dataset(name, subset, split=split, streaming=streaming)
     for batch in dataset.iter(batch_size=1000):
         yield from batch[text_field]

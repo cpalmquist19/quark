@@ -51,3 +51,11 @@ def test_tokenizer_defaults_follow_plan_rule():
     assert (tok.type, tok.size) == ("train", 8192)
     with pytest.raises(ValidationError, match="name is required"):
         TokenizerConfig(type="pretrained")
+
+
+def test_new_fields_leave_old_hashes_alone():
+    # Fields added after Phase 1 don't change the hash while unset, and do once set.
+    base = QuarkConfig()
+    assert base.config_hash() == QuarkConfig(data={"subset": None, "token_limit": None}).config_hash()
+    assert QuarkConfig(data={"subset": "sample-10BT"}).config_hash() != base.config_hash()
+    assert QuarkConfig(model={"params": {"position": {"base": 5e5}}}).config_hash() != base.config_hash()

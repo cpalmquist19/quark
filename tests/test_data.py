@@ -73,3 +73,36 @@ def test_fixed_batches_are_repeatable(data_dir):
     first = [x for x, _ in loader.fixed_batches(3)]
     second = [x for x, _ in loader.fixed_batches(3)]
     assert len(first) == 3 and all((a == b).all() for a, b in zip(first, second))
+
+
+def test_token_limit_stops_early_and_names_the_folder(tmp_path):
+    from .conftest import make_corpus
+
+    corpus = make_corpus(tmp_path / "corpus.txt", n_docs=3000)
+    data = DataConfig(source=str(corpus), tokenizer=TokenizerConfig(size=300), val_fraction=0.1, token_limit=20_000)
+    meta = prepare_dataset(data, tmp_path / "out")
+    total = meta["train_tokens"] + meta["val_tokens"]
+    assert 20_000 <= total < 20_000 + 1000 * 60  # stops within one batch of documents
+    assert meta["train_docs"] + meta["val_docs"] < 3000 and meta["token_limit"] == 20_000
+    assert default_data_dir(data, root="d").name == "corpus.txt-20k-bpe300"
+    hf = DataConfig(source="HuggingFaceFW/fineweb-edu", subset="sample-10BT", token_limit=500_000_000)
+    assert default_data_dir(hf, root="d").name == "fineweb-edu-sample-10bt-500m-bpe8192"
+    assert default_data_dir(DataConfig(), root="d").name == "tinystories-bpe8192"  # unchanged
+
+
+def test_hf_sources_pass_subset_and_streaming(monkeypatch):
+    import datasets
+
+    calls = []
+
+    class FakeDataset:
+        def iter(self, batch_size):
+            yield {"text": ["a", "b"]}
+
+    def fake_load(name, subset=None, split=None, streaming=False):
+        calls.append((name, subset, split, streaming))
+        return FakeDataset()
+
+    monkeypatch.setattr(datasets, "load_dataset", fake_load)
+    docs = list(iter_documents("org/name", subset="sample-10BT", streaming=True))
+    assert docs == ["a", "b"] and calls == [("org/name", "sample-10BT", "train", True)]
