@@ -1,19 +1,22 @@
-"""Baseline GPT assembled from component slots."""
+"""GPT assembled from component slots."""
 
-from quark.config import DEFAULT_SLOTS, ModelConfig
-from quark.model.gpt import GPT, KVCache
+import torch
 
-
-def build_model(cfg: ModelConfig) -> GPT:
-    """Build the model for `cfg`. Phase 1 supports only the baseline slot choices."""
-    unsupported = {slot: name for slot, name in cfg.slots.items() if DEFAULT_SLOTS.get(slot) != name}
-    if unsupported:
-        raise NotImplementedError(
-            f"slot choices {unsupported} aren't available yet; Phase 1 supports only {DEFAULT_SLOTS}"
-        )
-    if cfg.toggles:
-        raise NotImplementedError(f"toggles {sorted(cfg.toggles)} aren't available yet (component registry, Phase 2)")
-    return GPT(cfg)
+from quark.components import KVCache, check, raise_for_errors
+from quark.config import HardwareProfile, ModelConfig, QuarkConfig
+from quark.model.gpt import GPT
 
 
-__all__ = ["GPT", "KVCache", "build_model"]
+def build_model(cfg: ModelConfig, hardware: HardwareProfile | None = None) -> GPT:
+    """Build the model for `cfg`. Raises ComponentError, with reasons, if the slot choices are invalid."""
+    raise_for_errors(check(QuarkConfig(model=cfg), hardware, stages=("model",)))
+    return GPT(cfg, hardware)
+
+
+def count_params(cfg: ModelConfig, non_embedding: bool = False) -> int:
+    """Exact parameter count, without allocating memory (the model is built on the meta device)."""
+    with torch.device("meta"):
+        return GPT(cfg).num_params(non_embedding)
+
+
+__all__ = ["GPT", "KVCache", "build_model", "count_params"]

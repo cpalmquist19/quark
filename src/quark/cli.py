@@ -1,6 +1,6 @@
 """`quark` command-line entry point.
 
-Available: version, gpu detect|list, new, data prepare, train, generate. The rest of plan §13
+Available: version, gpu detect|list, components list|show, new, data prepare, train, generate. The rest of plan §13
 (plan, build, notebook, compare, export, models) arrives in later phases.
 """
 
@@ -22,6 +22,8 @@ gpu_app = typer.Typer(help="Detect and list GPU hardware profiles.", no_args_is_
 app.add_typer(gpu_app, name="gpu")
 data_app = typer.Typer(help="Prepare datasets.", no_args_is_help=True)
 app.add_typer(data_app, name="data")
+components_app = typer.Typer(help="Browse the component registry.", no_args_is_help=True)
+app.add_typer(components_app, name="components")
 
 # Windows consoles may use a legacy code page (e.g. cp1252); never crash on an unprintable character.
 for _stream in (sys.stdout, sys.stderr):
@@ -82,6 +84,62 @@ def gpu_list() -> None:
             ", ".join(profile.sdpa_kernels),
             source,
         )
+    console.print(table)
+
+
+@components_app.command("list")
+def components_list(slot: str | None = typer.Argument(None, help="Only this slot, e.g. attention.")) -> None:
+    """List registered components by slot."""
+    from quark.components import components, slots
+
+    known = [s.name for s in slots()]
+    if slot is not None and slot not in known:
+        console.print(f"[red]unknown slot {slot!r} (known: {', '.join(known)})[/red]")
+        raise typer.Exit(1)
+    table = Table()
+    table.add_column("component", no_wrap=True)
+    for column in ("maturity", "summary"):
+        table.add_column(column)
+    for spec in slots():
+        if slot is not None and spec.name != slot:
+            continue
+        for comp in components(spec.name):
+            table.add_row(comp.key(), comp.maturity, comp.summary)
+    console.print(table)
+
+
+@components_app.command("show")
+def components_show(key: str = typer.Argument(..., help="slot:name, e.g. position:rope.")) -> None:
+    """Show one component: paper, rules, hardware needs and parameters."""
+    from dataclasses import asdict
+
+    from quark.components import get
+
+    slot, _, name = key.partition(":")
+    try:
+        comp = get(slot, name)
+    except KeyError as err:
+        console.print(f"[red]{err.args[0]}[/red]")
+        raise typer.Exit(1) from err
+    table = Table(title=comp.key(), show_header=False)
+    table.add_row("summary", comp.summary)
+    table.add_row("paper", comp.paper or "-")
+    table.add_row("maturity", comp.maturity)
+    if implemented_by := getattr(comp, "implemented_by", ""):
+        table.add_row("implemented by", implemented_by)
+    table.add_row("requires", ", ".join(comp.requires) or "-")
+    table.add_row("conflicts", ", ".join(comp.conflicts) or "-")
+    hw = {k: v for k, v in asdict(comp.hw).items() if v}
+    table.add_row("hardware", ", ".join(f"{k}={v}" for k, v in hw.items()) or "any")
+    table.add_row("supports toggles", ", ".join(sorted(comp.supports)) or "-")
+    for rule in comp.rules:
+        table.add_row(f"rule ({rule.severity})", rule.reason)
+    if comp.prior is not None:
+        p = comp.prior
+        lo, hi = p.validated_params_m
+        table.add_row("prior", f"x{p.multiplier:g} compute ({p.confidence} confidence, {lo:g}-{hi:g}M params) {p.source}")
+    fields = comp.Params.model_fields
+    table.add_row("params", ", ".join(f"{k} = {f.default!r}" for k, f in fields.items()) or "-")
     console.print(table)
 
 

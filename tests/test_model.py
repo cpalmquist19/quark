@@ -1,8 +1,10 @@
 import pytest
 import torch
 
+from quark.components import ComponentError
 from quark.config import ModelConfig
-from quark.model import KVCache, build_model
+from quark.config.presets import get_preset
+from quark.model import build_model, count_params
 
 CFG = ModelConfig(vocab_size=97, d_model=32, n_layers=2, n_heads=4, seq_len=24)
 
@@ -45,7 +47,7 @@ def test_kv_cache_matches_full_forward(n_kv_heads):
     idx = torch.randint(0, 97, (2, 20))
     with torch.no_grad():
         full = model(idx)
-        cache = KVCache(CFG.n_layers)
+        cache = model.new_cache()
         prefill = model(idx[:, :12], cache=cache)
         steps = [model(idx[:, i : i + 1], cache=cache) for i in range(12, 16)]
         chunk = model(idx[:, 16:20], cache=cache)  # several tokens after a cached prefix
@@ -60,9 +62,60 @@ def test_rejects_too_long_input():
         make()(torch.zeros(1, 25, dtype=torch.long))
 
 
-def test_unsupported_slots_fail_clearly():
-    with pytest.raises(NotImplementedError, match="Phase 1 supports only"):
-        build_model(CFG.model_copy(update={"slots": {**CFG.slots, "position": "alibi"}}))
+def test_unknown_components_fail_clearly():
+    with pytest.raises(ComponentError, match=r"unknown position 'ropee'; did you mean 'rope'\?"):
+        build_model(CFG.model_copy(update={"slots": {**CFG.slots, "position": "ropee"}}))
+    with pytest.raises(ComponentError, match="param base: Input should be a valid number"):
+        build_model(CFG.model_copy(update={"params": {"position": {"base": "big"}}}))
+
+
+def test_component_params_reach_the_model():
+    model = build_model(CFG.model_copy(update={"params": {"position": {"base": 500.0}}}))
+    default = make()
+    assert not torch.allclose(model.pos.cos, default.pos.cos)
+
+
+# --- compatibility with checkpoints and configs written before the component registry ---------
+
+
+def test_checkpoint_keys_are_stable():
+    keys = list(make().state_dict())
+    assert keys == [
+        "tok_emb.weight",
+        *(
+            f"blocks.{i}.{name}"
+            for i in range(2)
+            for name in (
+                "attn_norm.weight",
+                "attn.qkv.weight",
+                "attn.out.weight",
+                "mlp_norm.weight",
+                "mlp.gate_up.weight",
+                "mlp.down.weight",
+            )
+        ),
+        "norm.weight",
+    ]
+
+
+def test_init_matches_pre_registry_model():
+    # Fingerprint of build_model(CFG) with seed 0 from the Phase 1 GPT, so the same seed keeps
+    # giving the same init and earlier baselines stay comparable.
+    weights = make().state_dict().values()
+    fingerprint = sum((i + 1) * t.double().abs().sum().item() for i, t in enumerate(weights))
+    assert fingerprint == pytest.approx(5026.476320238139, rel=1e-9)
+
+
+def test_config_hashes_are_stable():
+    # Hashes from before the registry: a changed hash would stop in-progress runs from resuming.
+    assert get_preset("smoke").config_hash() == "1fe908b783fd"
+    assert get_preset("tinystories-small").config_hash() == "37cee61dd2e4"
+
+
+def test_meta_param_count_is_exact():
+    assert count_params(CFG) == make().num_params()
+    assert count_params(CFG, non_embedding=True) == make().num_params(non_embedding=True)
+    assert count_params(get_preset("tinystories-small").model) == 17_308_032
 
 
 def test_overfits_one_batch():

@@ -49,6 +49,7 @@ Both notebooks show a live training dashboard. They're generated from one templa
 
 ```
 quark version | gpu detect [--save] | gpu list
+quark components list [<slot>] | components show <slot:name>
 quark new <name> [--preset smoke|tinystories-small]
 quark data prepare [--source ...] [--tokenizer train:8192|pretrained:smollm2] [--max-docs N]
 quark train <model> --data <dir> | --resume latest|best|<path> [--max-steps N]
@@ -61,4 +62,5 @@ quark generate <model> [--ckpt best|latest|<path>] [--prompt ...] [--samples N] 
 
 - Phase 0 (scaffold): done.
 - Phase 1 (baseline GPT, data, trainer, generation, notebooks): done. See the plan for the exit-criteria run.
-- Next: Phase 2, the component registry and first add-ons (Muon, WSD, QK-norm, GQA, DaRoPE, ...).
+- Phase 2: component registry done ([design](docs/component_registry.md)); the baseline is now built from registered components.
+- Next: the first add-ons (Muon, WSD, QK-norm, ALiBi/NoPE, DaRoPE, ...) and `quark compare`.

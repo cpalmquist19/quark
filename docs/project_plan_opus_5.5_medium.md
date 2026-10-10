@@ -138,6 +138,8 @@ quark/
 
 ## 5. The component registry (the heart of the project)
 
+Implemented design: [component_registry.md](component_registry.md). This section is the original proposal.
+
 Each technique is a class registered under a **slot**. A slot is a mutually exclusive choice (you pick exactly one position encoding, one attention type, one optimizer, …). Some things are **toggles** (independent on/off: QK-norm, z-loss, MTP, weight tying, gradient checkpointing).
 
 Slots keep the search space manageable: the number of combinations is the product of the slot sizes, not 2^(all features).
@@ -490,11 +492,10 @@ Optimizer implementations (Muon, etc.) are vendored as small, readable files wit
 - Trainer with all of Section 11 (stats, live plots, best/latest checkpoints, early stopping, resume).
 - Generate script.
 - **Hand-written** template notebooks for local + Colab (not generated yet).
-- ✅ Exit criteria: train a ~10–20M model on TinyStories on your 3070 Ti and on Colab, kill the Colab session mid-run, resume from Drive, and produce coherent stories.
+- ✅ Exit criteria: train a ~10–20M model on TinyStories on Colab, kill the Colab session mid-run, resume from Drive, and produce coherent stories. (**Changed 2026-10-10:** training is cloud-only for now, so the local 3070 Ti run is no longer required. Short local smoke tests are still fine.)
 
 **Phase 2: Registry + first addons**
-- Component base class, slots, `@register`, metadata, rules.
-- Refactor the baseline into components.
+- ✅ Component base class, slots, `@register`, metadata, rules; baseline refactored into components (2026-10-10). Design and decisions: [component_registry.md](component_registry.md). GQA/MQA are the `n_kv_heads` shape dimension rather than separate components.
 - Add GQA/MQA, QK-norm, ALiBi/NoPE, DaRoPE, ReLU², WSD, Muon, z-loss, grad checkpointing, 8-bit AdamW.
 - Per-component unit + overfit tests; ablation recipe (`quark compare`). Ablations use **paired seeds** (≥2–3). At this scale seed noise is the same size as many of the effects (E2 measured gains of 0.005–0.02 nats).
 

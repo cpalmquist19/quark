@@ -67,7 +67,8 @@ class HardwareProfile(_Strict):
 
 # --- Model / train / data -----------------------------------------------------------------------
 
-# Baseline choice per slot (plan §5.3). Later phases add alternatives through the component registry.
+# Baseline choice per model slot (plan §5.3). Alternatives come from the component registry
+# (quark.components); optimizer and schedule are the train-stage slots on TrainConfig.
 DEFAULT_SLOTS: dict[str, str] = {
     "position": "rope",
     "attention": "mha",
@@ -87,7 +88,8 @@ class ModelConfig(_Strict):
     ffn_mult: float = Field(8 / 3, gt=0)  # SwiGLU hidden = ffn_mult * d_model (rounded in the model)
     seq_len: int = Field(512, gt=0)
     slots: dict[str, str] = Field(default_factory=lambda: dict(DEFAULT_SLOTS))
-    toggles: dict[str, Any] = Field(default_factory=dict)  # independent on/off add-ons, e.g. {"qk_norm": True}
+    toggles: dict[str, Any] = Field(default_factory=dict)  # add-ons: {"qk_norm": True} or {"z_loss": {"coef": 1e-4}}
+    params: dict[str, dict[str, Any]] = Field(default_factory=dict)  # per-slot settings: {"position": {"base": 5e5}}
 
     @model_validator(mode="after")
     def _check_shapes(self) -> ModelConfig:
@@ -123,12 +125,12 @@ class DivergenceConfig(_Strict):
 
 
 class TrainConfig(_Strict):
-    optimizer: Literal["adamw"] = "adamw"  # more optimizers arrive with the registry (Phase 2)
+    optimizer: str = "adamw"  # a registered optimizer component
     lr: float = Field(3e-4, gt=0)
     min_lr_ratio: float = Field(0.1, ge=0, le=1)
     betas: tuple[float, float] = (0.9, 0.95)
     weight_decay: float = Field(0.1, ge=0)
-    schedule: Literal["cosine"] = "cosine"
+    schedule: str = "cosine"  # a registered schedule component
     warmup_steps: int = Field(200, ge=0)
     max_tokens: int = Field(100_000_000, gt=0)
     micro_batch: int = Field(16, gt=0)
@@ -136,6 +138,7 @@ class TrainConfig(_Strict):
     grad_clip: float | None = 1.0
     precision: Literal["auto", "bf16", "fp16", "fp32"] = "auto"  # auto = from the hardware profile
     seed: int = 1337
+    params: dict[str, dict[str, Any]] = Field(default_factory=dict)  # per-slot settings: {"schedule": {...}}
 
     # Runtime settings: they don't change what is learned, so they're excluded from config_hash()
     # and can be changed freely between resumes.
@@ -209,10 +212,15 @@ class QuarkConfig(_Strict):
 
         `name` and `hardware` are excluded on purpose: checkpoints are portable across GPUs. So are
         runtime settings such as logging cadence and early stopping (RUNTIME_TRAIN_FIELDS).
+        Component `params` are left out while empty, so configs written before they existed keep
+        their hash and their runs can still resume.
         """
         payload = self.model_dump(include={"model", "train", "data"}, mode="json")
         for field in RUNTIME_TRAIN_FIELDS:
             payload["train"].pop(field, None)
+        for section in ("model", "train"):
+            if not payload[section]["params"]:
+                del payload[section]["params"]
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode()).hexdigest()[:12]
 

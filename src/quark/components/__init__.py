@@ -1,1 +1,87 @@
-"""Component registry: one plug-in per technique, grouped into slots (Phase 2)."""
+"""Component registry: one plug-in per technique, grouped into slots (docs/component_registry.md).
+
+Importing this package registers the built-in components.
+"""
+
+from quark.components import attention, block, head, mlp, norm, optim, position, schedule  # noqa: F401  (registers)
+from quark.components.base import (
+    MLP,
+    Attention,
+    BuildContext,
+    Head,
+    KVCache,
+    LayerCache,
+    Norm,
+    OptimizerComponent,
+    PositionEncoding,
+    Schedule,
+    Stack,
+    Toggle,
+    mark_residual,
+)
+from quark.components.check import (
+    CheckContext,
+    ComponentError,
+    Issue,
+    Selection,
+    build_context,
+    check,
+    make_optimizer,
+    make_schedule,
+    raise_for_errors,
+    resolve,
+)
+from quark.components.registry import (
+    TOGGLE,
+    Component,
+    ComponentParams,
+    HwReq,
+    Prior,
+    Ref,
+    Rule,
+    SlotSpec,
+    components,
+    get,
+    names,
+    register,
+    slots,
+)
+
+__all__ = [
+    "MLP",
+    "TOGGLE",
+    "Attention",
+    "BuildContext",
+    "CheckContext",
+    "Component",
+    "ComponentError",
+    "ComponentParams",
+    "Head",
+    "HwReq",
+    "Issue",
+    "KVCache",
+    "LayerCache",
+    "Norm",
+    "OptimizerComponent",
+    "PositionEncoding",
+    "Prior",
+    "Ref",
+    "Rule",
+    "Schedule",
+    "Selection",
+    "SlotSpec",
+    "Stack",
+    "Toggle",
+    "build_context",
+    "check",
+    "components",
+    "get",
+    "make_optimizer",
+    "make_schedule",
+    "mark_residual",
+    "names",
+    "raise_for_errors",
+    "register",
+    "resolve",
+    "slots",
+]

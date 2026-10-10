@@ -8,7 +8,7 @@ import torch
 
 from quark.config import QuarkConfig
 from quark.data.tokenizer import eot_id, load_tokenizer
-from quark.model import GPT, KVCache, build_model
+from quark.model import GPT, build_model
 from quark.train.checkpoint import load_checkpoint
 
 
@@ -48,14 +48,14 @@ def generate_ids(
     seq_len = model.cfg.seq_len
     ids = list(prompt_ids) or ([stop_id] if stop_id is not None else [0])
     new: list[int] = []
-    cache = KVCache(model.cfg.n_layers)
+    cache = model.new_cache()
     pending = ids[-seq_len:]  # tokens not yet in the cache
 
     with _autocast(device):
         while len(new) < max_new_tokens:
             if cache.length + len(pending) > seq_len:
                 # Context is full: re-prefill the last half window (amortizes the cost of sliding).
-                cache = KVCache(model.cfg.n_layers)
+                cache = model.new_cache()
                 pending = (ids + new)[-(seq_len // 2) :]
             x = torch.tensor([pending], device=device)
             logits = model(x, cache=cache)[0, -1].float()

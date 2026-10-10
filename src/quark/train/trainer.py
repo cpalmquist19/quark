@@ -17,6 +17,7 @@ from typing import Callable
 import torch
 
 import quark
+from quark.components import check, make_optimizer, make_schedule, raise_for_errors
 from quark.config import HardwareProfile, QuarkConfig
 from quark.data import BatchLoader, TokenData
 from quark.model import build_model
@@ -66,6 +67,10 @@ class Trainer:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.hardware = hardware if hardware is not None else self._detect_hardware()
         self.precision = self._resolve_precision()
+        self.issues = check(cfg, self.hardware)  # component rules; errors stop here, before any work
+        raise_for_errors(self.issues)
+        for issue in self.issues:
+            self.log(f"{'warning' if issue.severity == 'warning' else 'note'}: {issue.source}: {issue.message}")
 
         torch.manual_seed(self.tcfg.seed)
         if self.device.type == "cuda":
@@ -82,14 +87,15 @@ class Trainer:
         self.val_loader = BatchLoader(self.data.val, seq, self.tcfg.micro_batch, 0, False, self.device)
 
         # Model and optimizer
-        self.raw_model = build_model(cfg.model).to(self.device)
+        self.raw_model = build_model(cfg.model, self.hardware).to(self.device)
         self.model = torch.compile(self.raw_model) if self.tcfg.compile else self.raw_model
-        self.optimizer = self._make_optimizer()
+        self.optimizer = make_optimizer(cfg, self.raw_model, self.device)
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.precision == "fp16" and self.device.type == "cuda")
 
         # Schedule and bookkeeping
         self.tokens_per_step = self.tcfg.tokens_per_step(seq)
         self.total_steps = max(1, self.tcfg.max_tokens // self.tokens_per_step)
+        self.schedule = make_schedule(cfg, self.total_steps)
         self.step = 0
         self.tokens = 0
         self.train_time_s = 0.0
@@ -134,17 +140,6 @@ class Trainer:
             return "fp16"
         return requested
 
-    def _make_optimizer(self) -> torch.optim.Optimizer:
-        decay = [p for p in self.raw_model.parameters() if p.dim() >= 2]  # matrices and embeddings
-        no_decay = [p for p in self.raw_model.parameters() if p.dim() < 2]  # norm gains
-        groups = [
-            {"params": decay, "weight_decay": self.tcfg.weight_decay},
-            {"params": no_decay, "weight_decay": 0.0},
-        ]
-        return torch.optim.AdamW(
-            groups, lr=self.tcfg.lr, betas=self.tcfg.betas, fused=self.device.type == "cuda"
-        )
-
     def _init_run_dir(self) -> None:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.cfg.to_yaml(self.run_dir / "config.yaml")
@@ -160,18 +155,13 @@ class Trainer:
             "quark_version": quark.__version__,
         }
         (self.run_dir / "run.json").write_text(json.dumps(run_info, indent=2), encoding="utf-8")
+        for issue in self.issues:
+            self._event(f"component_{issue.severity}", f"{issue.source}: {issue.message}")
 
     # --- schedule --------------------------------------------------------------------------------
 
     def lr_at(self, step: int) -> float:
-        t = self.tcfg
-        if step < t.warmup_steps:
-            lr = t.lr * (step + 1) / t.warmup_steps
-        else:
-            progress = min(1.0, (step - t.warmup_steps) / max(1, self.total_steps - t.warmup_steps))
-            min_lr = t.lr * t.min_lr_ratio
-            lr = min_lr + 0.5 * (t.lr - min_lr) * (1 + math.cos(math.pi * progress))
-        return lr * self.lr_mult
+        return self.schedule.lr_at(step) * self.lr_mult
 
     def _autocast(self):
         if self.precision == "fp32":
