@@ -23,10 +23,12 @@ A composable transformer workbench: start with a baseline GPT, bolt on technique
 
 **North star:** the best-capability model we can train on our GPUs, with **far fewer parameters than is typical for its quality class**. The 2026 literature gives two levers for this, and the plan is built around them. The first is *parameter reuse at equal compute* (looped/Hyperloop blocks, fixed-point "attractor" blocks). The second is *nearly-free per-layer upgrades validated at 50–350M scale*. Paper-by-paper evidence and verdicts: [ml_papers3.txt](ml_papers3.txt). Entry IDs such as `B2` or `C1` below refer to that file.
 
+**Product target (2026-10-10):** a ~125–350M-param chatbot with 2048-token context, trained on FineWeb-Edu with neurodivergence, education and pre-K/kindergarten content upweighted. See §18; it decides how components are tested.
+
 **Non-goals (for now)**
 - Evals. Instead, a clean export interface (Section 12) so your separate eval project can consume checkpoints.
 - Multi-GPU / distributed training. Design so it can be added later, but don't build it now.
-- Fine-tuning recipes (SFT/RLHF). Possibly a later phase.
+- Fine-tuning recipes (SFT/RLHF). ~~Possibly a later phase.~~ **Changed 2026-10-10:** chat SFT is now Phase 2c, for the chatbot target (§18). RLHF remains a non-goal.
 
 ---
 
@@ -501,10 +503,13 @@ Optimizer implementations (Muon, etc.) are vendored as small, readable files wit
 - ✅ Component base class, slots, `@register`, metadata, rules; baseline refactored into components (2026-10-10). Design and decisions: [component_registry.md](component_registry.md). GQA/MQA are the `n_kv_heads` shape dimension rather than separate components.
 - ✅ QK-norm, ALiBi/NoPE, ReLU², WSD, Muon, z-loss (2026-10-10; see [component_registry.md §9](component_registry.md)).
 - Still to add: DaRoPE, grad checkpointing, 8-bit AdamW.
-- Per-component unit + overfit tests; ablation recipe (`quark compare`). Ablations use **paired seeds** (≥2–3). At this scale seed noise is the same size as many of the effects (E2 measured gains of 0.005–0.02 nats).
+- ✅ Per-component contract tests (shapes, causality, KV cache, overfit, param count) for every registered component.
+- `quark compare`: baseline + arms × **paired seeds** (≥2–3), equal token budget, report with paired deltas, speed and an equal-time estimate. At this scale seed noise is the same size as many of the effects (E2 measured gains of 0.005–0.02 nats). Ablation ladder presets `ablation-s` (~10M) and `ablation-m` (~40M) at seq_len 2048 (§18.2).
+- **Data mixtures** (added for §18): several sources with weights and filters (audience, topic, keyword), a validation split per source, and per-domain val loss in the trainer, plots and compare reports.
+- First experiments on the target mix: domain weights, then the component arms.
 
 **Phase 2b: Parameter-efficiency stack (the project's north star)**
-Each step is ablated against the previous best at the same token budget, starting at ~30–60M on TinyStories / FineWeb-Edu, cheapest and most certain first:
+Each step is ablated against the previous best at the same token budget on the target data mix (§18), using the s/m ladder, cheapest and most certain first:
 1. LayerRoPE (C1): ~40 lines, ~0 FLOPs, fewer params, −0.07 loss at 134M in the paper.
 2. Value residual → SATFormer gate (C2).
 3. Sink logit (+ projection value gate at ≥100M) (E2).
@@ -514,6 +519,12 @@ Each step is ablated against the previous best at the same token budget, startin
 7. **Architecture bake-off at equal training FLOPs**: plain vs **Hyperloop** (B2, with orthogonal input injection B4, symmetry-broken stream init C4, unrolled-depth init G1) vs **Attractor** fixed-point block (E1). Report params, val loss, tokens/sec and peak memory. The expected outcome is matching or beating plain with ~50–60% of the params. Be ready for a null result too: CART (B7) found no win at small width and ~1B tokens.
 8. Data-side extras: stack-task warm-up (E3), weak-teacher KD (F3), masked-input regularization when multi-epoch (A8).
 - ✅ Exit criteria: a documented "Quark recommended stack" with measured multipliers in `runs.db`, plus planner priors updated from those runs.
+
+**Phase 2c: Chat model (added 2026-10-10, §18)**
+- Chat format and template, special tokens, loss on assistant turns only.
+- SFT data: general instruction/chat sets plus domain conversations (education, neurodivergence-informed, early-childhood level), curated for accuracy and safety.
+- `quark chat` for interactive testing; a small held-out chat set with per-domain loss.
+- Final pretraining run of the recommended stack at the target size on a paid GPU, then SFT.
 
 **Phase 3: Planner**
 - Hardware + purpose profiles, `gpu bench`.
@@ -561,9 +572,47 @@ Each step is ablated against the previous best at the same token budget, startin
 ## 17. Open questions for you
 
 1. ~~**"DaRope"**~~ **Resolved:** DaRoPE = "RoPE is Dead, Long Live RoPE" (arXiv 2609.34556). See [darope_integration_report.md](darope_integration_report.md).
-2. ~~**First purpose / dataset**~~ **Decided 2026-10-09:** the target is a **small general-English text model**. Phase 1 uses **TinyStories** to prove the pipeline end to end (fast, coherent output at 10–30M). Phase 2b ablations and the main models use **FineWeb-Edu** (a sample sized to the planner's token budget), matching most cited papers so results are comparable. Add a `fineweb-edu` purpose profile next to `tinystories`.
+2. ~~**First purpose / dataset**~~ **Superseded 2026-10-10 by §18** (domain-focused chatbot, ~125–350M, 2048 context, FineWeb-Edu + upweighted domains). **Decided 2026-10-09:** the target is a **small general-English text model**. Phase 1 uses **TinyStories** to prove the pipeline end to end (fast, coherent output at 10–30M). Phase 2b ablations and the main models use **FineWeb-Edu** (a sample sized to the planner's token budget), matching most cited papers so results are comparable. Add a `fineweb-edu` purpose profile next to `tinystories`.
 3. ~~**Tokenizer preference**~~ **Resolved:** custom ~8k BPE by default, SmolLM2 tokenizer for larger / broad-data / KD models. The planner picks per model; see "Tokenizer rule" in §7.4.
 4. ~~**Experiment tracking**~~ **Decided (default):** local `metrics.jsonl` + PNG plots, mirrored to Drive on Colab. W&B is an optional toggle added in Phase 6. No account or API key is needed to start.
 5. ~~**Local environment**~~ **Decided (default):** native Windows. Every recommended component is pure PyTorch + SDPA, and WSL2 currently has no Linux distro installed (only `docker-desktop`). Revisit only for Gated-DeltaNet hybrids (F2). **Setup blocker found 2026-10-09:** the installed PyTorch is `2.13.0+cpu`, which can't see the GPU (RTX 3070 Ti Laptop, 8 GB, driver 595.79). Phase 0 must create a project venv with a CUDA build of PyTorch and verify `torch.cuda.is_available()`.
 6. ~~**Repo hosting**~~ **Decided (default):** `git init` locally in Phase 0, with an optional *private* GitHub repo (`gh` is installed). Notebooks stay **self-contained** (code embedded via `%%writefile`), so Colab never needs GitHub credentials. **As built (2026-10-10):** the repo is on GitHub (`cpalmquist19/quark`) and the Phase 1 notebooks install from it; the `%%writefile` mode comes with Phase 4 (see §10).
 7. ~~**Eval interface**~~ **Finding:** the eval project (`C:\Code\ai-agent\evals`) scores *agentic tool use* of chat models through LM Studio / OpenAI-compatible APIs. A from-scratch 10–150M base model can't do tool calling, and LM Studio's llama.cpp can't load our custom architectures (Hyperloop, LayerRoPE, …), so that harness isn't a fit for Quark models. **Decision:** Quark gets its own lightweight evals: validation loss/perplexity, plus a few small-model benchmarks (e.g. BLiMP, HellaSwag, ARC-Easy, LAMBADA) via a `loglikelihood(text)` API. An OpenAI-compatible `quark serve` endpoint stays a "later" item, if a Quark model is ever instruction-tuned.
+
+---
+
+## 18. Target model: a domain-focused chatbot (decided 2026-10-10)
+
+The models Phase 2b selects components for are aimed at this target. TinyStories (Phase 1) proved the pipeline; it is no longer the yardstick.
+
+| | Decision |
+|---|---|
+| Use | A **chatbot**: pretraining, then chat fine-tuning (SFT, Phase 2c) |
+| Size | **~125–350M params**, final training on a **paid GPU** (Colab Pro / rented L4 or A100). Ablations still run on the free T4 |
+| Context | **2048 tokens** (multi-turn chat); YaRN (Phase 5) can extend it later |
+| Data | **FineWeb-Edu as the general-English base**, with three domains upweighted beyond their natural share: **neurodivergence** (autism, ADHD, dyslexia, executive function, sensory processing, special education), **education** (teaching, learning, pedagogy) and **pre-K / kindergarten-level knowledge and language** |
+| Tokenizer | Open. The §7.4 rule points to SmolLM2's 49k tokenizer at this size; a custom ~32k BPE trained on the mix may fit child-level and domain vocabulary better. Decide with a test at the ~40M rung |
+
+### 18.1 Data sources (first survey, 2026-10-10)
+
+| Domain | Source | Status |
+|---|---|---|
+| General English | `HuggingFaceFW/fineweb-edu` | Planned base |
+| Young-children knowledge and language | `HuggingFaceTB/cosmopedia` (Apache-2.0, ~25B tokens of synthetic textbooks, stories, WikiHow-style text; `audience` and `format` columns allow filtering to the youngest audiences); `roneneldan/TinyStories` | Confirmed audience values seen so far: `grade_school_students`, `college_students`. Check the full value list before relying on a "young children" filter |
+| Education | FineWeb-Edu filtered by topic: the WebOrganizer topic classifier (24 topics, incl. "Education & Jobs" and "Health") and/or keyword filters | Standard domain-upweighting approach |
+| Neurodivergence | **No ready-made knowledge corpus found** (only small labeled social-media or diagnostic sets). Keyword/topic-filtered web text first; carefully reviewed synthetic text possibly later | Needs curation |
+
+Cautions:
+- **Repetition.** Upweighting a small domain means repeating it. Repeated text loses value after a few epochs (A8), so domain weights trade emphasis against repetition.
+- **Content quality.** Web text on neurodivergence includes outdated, stigmatizing or wrong material. That slice needs curation. If the chatbot will talk with children or neurodivergent users, the SFT stage needs care with accuracy and safety, and the model must not present itself as a source of diagnosis or medical advice.
+
+### 18.2 How components are tested so results transfer to the target
+
+1. **Target data.** Ablations train on a scaled-down sample of the target mix, not TinyStories.
+2. **Target context.** Ablations use seq_len 2048. Position-encoding differences mostly show at longer context.
+3. **Per-domain validation.** Val loss is reported separately for general / education / neurodivergence / early-childhood, so domain emphasis is measured and trade-offs show up.
+4. **Scale ladder.** Every component is tested at ~10M (`ablation-s`) and finalists at ~40M (`ablation-m`) on the T4. Trust a gain that holds or grows from s to m; distrust one that shrinks. The final stack gets one confirmation run at the target size on the paid GPU.
+5. **Same regime at every rung.** Each rung keeps the target's seq_len, tokenizer family and deep-and-thin shape, with the LR from the D1 size rule. Optimizer arms (e.g. Muon) get a small LR sweep on the s rung.
+6. **Per hour as well as per token.** Reports show the loss difference at equal tokens and an estimate at equal wall-clock, because the real budget is GPU hours.
+7. **Know what small runs can't show.** Stability add-ons (QK-norm, z-loss) are judged by a high-LR stress arm or adopted on evidence. Schedules (WSD vs cosine) are judged partly on practicality: a multi-session target run benefits from WSD's extendable stable phase.
+8. **The data mix is an experiment too.** Domain weights are tuned at the s rung. Small-proxy mixture rankings largely transfer to larger models (RegMix, arXiv 2407.01492), which makes this one of the cheapest, highest-value experiments.

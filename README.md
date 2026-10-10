@@ -10,6 +10,11 @@ planner pick the best valid configuration for your GPU and goal, then train it o
 Training currently runs on **Colab (free T4)**; the local machine is used for development, tests and short
 smoke runs.
 
+**Target model:** a ~125–350M-param chatbot (2048-token context) trained on general educational English with
+neurodivergence, education and pre-K/kindergarten content emphasized; final training on a paid GPU. Components
+are chosen by small, cheap experiments designed to transfer to that size. See
+[plan §18](docs/project_plan_opus_5.5_medium.md#18-target-model-a-domain-focused-chatbot-decided-2026-10-10).
+
 ## Setup (Windows, for development)
 
 Requires [uv](https://docs.astral.sh/uv/). This creates `.venv/` with the CUDA build of PyTorch:
@@ -113,4 +118,5 @@ quark generate <model> [--ckpt best|latest|<path>] [--prompt ...] [--samples N] 
 - Phase 1 (baseline GPT, data, trainer, generation, notebooks): done, exit criteria met on Colab (val loss 1.48, resume from Drive verified).
 - Phase 2: component registry done ([design](docs/component_registry.md)); the baseline is now built from registered components.
 - First add-ons done: Muon, WSD, QK-norm, z-loss, ALiBi, NoPE, ReLU² (`quark components list`).
-- Next: `quark compare` (paired-seed ablations), then DaRoPE, grad checkpointing and 8-bit AdamW.
+- Next: `quark compare` (paired-seed ablations) with the `ablation-s` / `ablation-m` ladder, then data
+  mixtures with per-domain validation, then the first experiments on the target mix.
