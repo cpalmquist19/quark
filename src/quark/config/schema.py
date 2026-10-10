@@ -106,21 +106,68 @@ class ModelConfig(_Strict):
         return self.d_model // self.n_heads
 
 
+class EarlyStoppingConfig(_Strict):
+    enabled: bool = True
+    patience: int = Field(5, gt=0)  # evals without a min_delta improvement in val loss
+    min_delta: float = Field(0.005, ge=0)
+    gap_window: int = Field(5, gt=1)  # evals over which a growing val-train gap triggers a warning
+    stop_on_gap: bool = False  # warn only by default
+
+
+class DivergenceConfig(_Strict):
+    enabled: bool = True
+    spike_sigma: float = Field(6.0, gt=0)  # a loss this many std devs above the recent mean is a spike
+    window: int = Field(100, gt=10)  # recent steps used for the mean/std
+    max_rollbacks: int = Field(3, ge=0)
+    lr_backoff: float = Field(0.5, gt=0, le=1)  # LR multiplier applied after each rollback
+
+
 class TrainConfig(_Strict):
-    optimizer: str = "adamw"
+    optimizer: Literal["adamw"] = "adamw"  # more optimizers arrive with the registry (Phase 2)
     lr: float = Field(3e-4, gt=0)
+    min_lr_ratio: float = Field(0.1, ge=0, le=1)
+    betas: tuple[float, float] = (0.9, 0.95)
     weight_decay: float = Field(0.1, ge=0)
-    schedule: str = "cosine"
+    schedule: Literal["cosine"] = "cosine"
     warmup_steps: int = Field(200, ge=0)
     max_tokens: int = Field(100_000_000, gt=0)
     micro_batch: int = Field(16, gt=0)
     grad_accum: int = Field(1, gt=0)
     grad_clip: float | None = 1.0
     precision: Literal["auto", "bf16", "fp16", "fp32"] = "auto"  # auto = from the hardware profile
-    eval_every_steps: int = Field(250, gt=0)
-    checkpoint_every_steps: int = Field(1000, gt=0)
-    checkpoint_every_min: float | None = None  # time-based saves (Colab)
     seed: int = 1337
+
+    # Runtime settings: they don't change what is learned, so they're excluded from config_hash()
+    # and can be changed freely between resumes.
+    compile: bool = False  # torch.compile; needs Triton (Linux/WSL2 or triton-windows)
+    log_every_steps: int = Field(10, gt=0)
+    eval_every_steps: int = Field(250, gt=0)
+    eval_batches: int = Field(20, gt=0)
+    checkpoint_every_steps: int = Field(1000, gt=0)
+    checkpoint_every_min: float | None = None  # time-based saves; defaults from the hardware session
+    keep_last: int = Field(2, ge=0)  # rolling step checkpoints kept besides latest.pt and best.pt
+    time_limit_min: float | None = None  # stop + save before this; defaults from the hardware session
+    early_stopping: EarlyStoppingConfig = Field(default_factory=EarlyStoppingConfig)
+    divergence: DivergenceConfig = Field(default_factory=DivergenceConfig)
+
+    def tokens_per_step(self, seq_len: int) -> int:
+        return self.micro_batch * self.grad_accum * seq_len
+
+
+RUNTIME_TRAIN_FIELDS = frozenset(
+    {
+        "compile",
+        "log_every_steps",
+        "eval_every_steps",
+        "eval_batches",
+        "checkpoint_every_steps",
+        "checkpoint_every_min",
+        "keep_last",
+        "time_limit_min",
+        "early_stopping",
+        "divergence",
+    }
+)
 
 
 class TokenizerConfig(_Strict):
@@ -137,9 +184,15 @@ class TokenizerConfig(_Strict):
             raise ValueError("tokenizer.name is required when type is 'pretrained'")
         return self
 
+    def tag(self) -> str:
+        """Short label for directory names, e.g. 'bpe8192' or 'smollm2'."""
+        return f"bpe{self.size}" if self.type == "train" else str(self.name).replace("/", "-")
+
 
 class DataConfig(_Strict):
-    source: str = "roneneldan/TinyStories"  # HF dataset name or a local path
+    source: str = "roneneldan/TinyStories"  # HF dataset name or a local file/folder
+    split: str = "train"  # HF split to read; train/val are split by Quark (hash-based)
+    text_field: str = "text"
     tokenizer: TokenizerConfig = Field(default_factory=TokenizerConfig)
     val_fraction: float = Field(0.005, gt=0, lt=0.5)
 
@@ -154,9 +207,12 @@ class QuarkConfig(_Strict):
     def config_hash(self) -> str:
         """Short, stable hash of everything that affects checkpoint compatibility.
 
-        `name` and `hardware` are excluded on purpose: checkpoints are portable across GPUs.
+        `name` and `hardware` are excluded on purpose: checkpoints are portable across GPUs. So are
+        runtime settings such as logging cadence and early stopping (RUNTIME_TRAIN_FIELDS).
         """
         payload = self.model_dump(include={"model", "train", "data"}, mode="json")
+        for field in RUNTIME_TRAIN_FIELDS:
+            payload["train"].pop(field, None)
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode()).hexdigest()[:12]
 

@@ -1,12 +1,14 @@
 """`quark` command-line entry point.
 
-Phase 0 provides `version` and `gpu detect|list`. The remaining commands in plan §13 (plan, build,
-data, notebook, train, generate, compare, export, models) are added in later phases.
+Available: version, gpu detect|list, new, data prepare, train, generate. The rest of plan §13
+(plan, build, notebook, compare, export, models) arrives in later phases.
 """
 
 from __future__ import annotations
 
 import platform
+import sys
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -18,6 +20,13 @@ from quark.config import HardwareProfile
 app = typer.Typer(help="Quark: plan, build and train small transformers.", no_args_is_help=True)
 gpu_app = typer.Typer(help="Detect and list GPU hardware profiles.", no_args_is_help=True)
 app.add_typer(gpu_app, name="gpu")
+data_app = typer.Typer(help="Prepare datasets.", no_args_is_help=True)
+app.add_typer(data_app, name="data")
+
+# Windows consoles may use a legacy code page (e.g. cp1252); never crash on an unprintable character.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure") and (_stream.encoding or "").lower() not in ("utf-8", "utf8"):
+        _stream.reconfigure(errors="replace")
 
 console = Console()
 
@@ -74,6 +83,140 @@ def gpu_list() -> None:
             source,
         )
     console.print(table)
+
+
+@app.command()
+def new(
+    name: str = typer.Argument(..., help="Model name; creates models/<name>/config.yaml."),
+    preset: str = typer.Option("tinystories-small", help="Starting config: smoke | tinystories-small."),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing config.yaml."),
+) -> None:
+    """Create a model folder from a preset config."""
+    from quark.config.presets import get_preset
+    from quark.project import create_model
+
+    try:
+        directory = create_model(name, get_preset(preset), force=force)
+    except (KeyError, FileExistsError) as err:
+        console.print(f"[red]{err}[/red]")
+        raise typer.Exit(1) from err
+    console.print(f"Created {directory / 'config.yaml'} from preset {preset!r}. Edit it, then:")
+    console.print(f"  quark data prepare --source <dataset> && quark train {directory}")
+
+
+@data_app.command("prepare")
+def data_prepare(
+    source: str = typer.Option("roneneldan/TinyStories", help="Hugging Face dataset name, or a local file/folder."),
+    out: Path | None = typer.Option(None, help="Output folder (default: data/<source>-<tokenizer>)."),
+    tokenizer: str = typer.Option("train:8192", help="train:<vocab size> or pretrained:<name> (e.g. smollm2)."),
+    split: str = typer.Option("train", help="Hugging Face split to read."),
+    text_field: str = typer.Option("text", help="Field/column holding the text."),
+    val_fraction: float = typer.Option(0.005, help="Fraction of documents held out for validation."),
+    max_docs: int | None = typer.Option(None, help="Only use the first N documents (quick tests)."),
+    tokenizer_sample_docs: int = typer.Option(200_000, help="Documents used to train a BPE tokenizer."),
+) -> None:
+    """Tokenize a dataset once into memory-mapped train/val files."""
+    from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+
+    from quark.config import DataConfig, TokenizerConfig
+    from quark.data import default_data_dir, prepare_dataset
+
+    kind, _, value = tokenizer.partition(":")
+    if kind == "train" and value.isdigit():
+        tok = TokenizerConfig(type="train", size=int(value))
+    elif kind == "pretrained" and value:
+        tok = TokenizerConfig(type="pretrained", name=value, size=None)
+    else:
+        console.print("[red]--tokenizer must look like train:8192 or pretrained:smollm2[/red]")
+        raise typer.Exit(1)
+    data = DataConfig(source=source, split=split, text_field=text_field, tokenizer=tok, val_fraction=val_fraction)
+    out = out or default_data_dir(data)
+
+    with Progress(SpinnerColumn("line"), TextColumn("{task.description}"), TimeElapsedColumn(), console=console) as bar:
+        task = bar.add_task("loading source and building tokenizer...")
+
+        def progress(docs: int, tokens: int) -> None:
+            bar.update(task, description=f"tokenized {docs:,} docs, {tokens / 1e6:,.1f}M tokens")
+
+        meta = prepare_dataset(data, out, max_docs=max_docs, tokenizer_sample_docs=tokenizer_sample_docs, progress=progress)
+
+    console.print(
+        f"Wrote {out}: vocab {meta['vocab_size']:,}, train {meta['train_tokens'] / 1e6:,.1f}M tokens "
+        f"({meta['train_docs']:,} docs), val {meta['val_tokens'] / 1e6:,.2f}M tokens ({meta['val_docs']:,} docs)"
+    )
+
+
+@app.command()
+def train(
+    model: str = typer.Argument(..., help="Model name or folder (with config.yaml)."),
+    data: Path | None = typer.Option(None, help="Prepared data folder (default: the resumed run's, if resuming)."),
+    resume: str | None = typer.Option(None, help="latest | best | path to a checkpoint."),
+    allow_config_change: bool = typer.Option(False, "--allow-config-change", help="Resume even if the config changed."),
+    max_steps: int | None = typer.Option(None, help="Stop after this many steps (for quick tests)."),
+) -> None:
+    """Train a model (new run, or resume an existing one)."""
+    import json
+
+    from quark.project import load_model_config, model_dir, new_run_dir, resolve_checkpoint
+    from quark.train import ConfigMismatchError, Trainer
+
+    directory = model_dir(model)
+    cfg = load_model_config(directory)
+    checkpoint = None
+    if resume:
+        try:
+            checkpoint = resolve_checkpoint(directory, resume)
+        except FileNotFoundError as err:
+            console.print(f"[red]{err}[/red]")
+            raise typer.Exit(1) from err
+        run_dir = checkpoint.parent
+        if data is None:
+            data = Path(json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["data_dir"])
+    else:
+        if data is None:
+            console.print("[red]pass --data <prepared data folder> (see `quark data prepare`)[/red]")
+            raise typer.Exit(1)
+        run_dir = new_run_dir(directory)
+
+    try:
+        trainer = Trainer(cfg, data, run_dir, resume_from=checkpoint, allow_config_change=allow_config_change, max_steps=max_steps)
+    except ConfigMismatchError as err:
+        console.print(f"[red]{err}[/red]")
+        raise typer.Exit(1) from err
+    result = trainer.fit()
+    console.print(f"best val loss {result.best_val:.4f}; checkpoints in {result.run_dir}")
+
+
+@app.command()
+def generate(
+    model: str = typer.Argument(..., help="Model name or folder."),
+    ckpt: str = typer.Option("best", help="best | latest | path to a checkpoint."),
+    prompt: str = typer.Option("Once upon a time", help="Text to continue."),
+    max_new: int = typer.Option(200, help="Maximum new tokens."),
+    temperature: float = typer.Option(0.8, help="0 = greedy."),
+    top_p: float = typer.Option(0.9, help="Nucleus sampling threshold (1 = off)."),
+    top_k: int = typer.Option(0, help="Top-k sampling (0 = off)."),
+    samples: int = typer.Option(1, help="Number of samples."),
+    seed: int | None = typer.Option(None, help="Random seed for reproducible samples."),
+) -> None:
+    """Generate text from a trained checkpoint."""
+    from quark.infer import generate_text, load_for_inference
+    from quark.project import model_dir, resolve_checkpoint
+
+    try:
+        path = resolve_checkpoint(model_dir(model), ckpt)
+    except FileNotFoundError as err:
+        console.print(f"[red]{err}[/red]")
+        raise typer.Exit(1) from err
+    net, tokenizer, _ = load_for_inference(path)
+    console.print(f"[dim]{path}[/dim]")
+    for i in range(samples):
+        text = generate_text(
+            net, tokenizer, prompt, max_new, temperature, top_k, top_p, None if seed is None else seed + i
+        )
+        if samples > 1:
+            console.print(f"\n--- sample {i + 1} ---", style="bold")
+        console.print(text, markup=False, highlight=False)
 
 
 def _profile_table(profile: HardwareProfile) -> Table:
