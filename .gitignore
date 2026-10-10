@@ -8,7 +8,7 @@ build/
 dist/
 
 # Data and training outputs (large, regenerable)
-data/
+/data/
 models/*/runs/
 *.pt
 *.bin
