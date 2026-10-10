@@ -488,6 +488,11 @@ Optimizer implementations (Muon, etc.) are vendored as small, readable files wit
 
 ## 15. Roadmap (build value end-to-end early)
 
+**Current focus (2026-10-10):** Phase 2 experiments. `first-batch` (8 component arms on FineWeb-Edu at
+`ablation-s`) is running on Colab; next, build the `chatbot-v1` mix, review its neurodivergence curation, read
+`first-batch` and confirm winners at `ablation-m`, then run `experiments/mix-weights.yaml`. The ordered list
+with owners is in the README's "Next steps".
+
 **Phase 0: Scaffold — ✅ done 2026-10-09**
 - `pyproject`, package layout, config schema, CLI skeleton, `gpu detect`, tests setup, git init. Project venv via `uv sync` (Python 3.12, torch 2.14.1+cu130); `quark version`, `quark gpu detect [--save]`, `quark gpu list`; built-in presets in `src/quark/hardware/presets/`, user-saved profiles in `./hardware/`; 14 tests passing including a real-GPU detection test.
 
@@ -506,7 +511,8 @@ Optimizer implementations (Muon, etc.) are vendored as small, readable files wit
 - ✅ Per-component contract tests (shapes, causality, KV cache, overfit, param count) for every registered component.
 - ✅ (2026-10-10) `quark compare`: baseline + arms × **paired seeds** (≥2–3), equal token budget, report with paired deltas, speed and an equal-time estimate. At this scale seed noise is the same size as many of the effects (E2 measured gains of 0.005–0.02 nats). Ablation ladder presets `ablation-s` (8.5M, 40M tokens) and `ablation-m` (38M, 200M tokens) at seq_len 2048 (§18.2). Runs seed by seed, skips finished runs, resumes unfinished ones and respects the Colab session limit; `notebooks/quark_compare_colab.ipynb` runs it on Colab. Spec format: `experiments/first-batch.yaml`.
 - ✅ (2026-10-10) **Data mixtures** (added for §18): recipes (`mixes/*.yaml`) of streamed sources with filters (domain keyword density, dataset columns, excluded sites/patterns); resumable CPU collection that fills every source sharing a stream in one pass; a shared tokenizer; training weights in `data.weights` (compare arms, no re-preparation); per-source validation and epoch warnings; per-source deltas in compare reports; `notebooks/quark_data_colab.ipynb` (CPU runtime). First recipe: `mixes/chatbot-v1.yaml`.
-- First experiments on the target mix: domain weights, then the component arms.
+- Experiments (in progress): `experiments/first-batch.yaml` (components on FineWeb-Edu), then
+  `experiments/mix-weights.yaml` (domain weights on the chatbot-v1 mix); winners confirmed at `ablation-m`.
 
 **Phase 2b: Parameter-efficiency stack (the project's north star)**
 Each step is ablated against the previous best at the same token budget on the target data mix (§18), using the s/m ladder, cheapest and most certain first:

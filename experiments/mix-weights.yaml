@@ -1,0 +1,25 @@
+# How much should each domain be upweighted? (plan §18.2, item 8)
+# Runs on the chatbot-v1 mix, so build it first: notebooks/quark_data_colab.ipynb (CPU runtime).
+#   quark compare check experiments/mix-weights.yaml
+#   quark compare run experiments/mix-weights.yaml --data data/mix-chatbot-v1-bpe8192
+# On Colab: paste this file into the Settings cell of notebooks/quark_compare_colab.ipynb.
+#
+# Read the per-source table in the report: the goal is lower loss on the domain sources without giving up
+# much on `general`. The headline val loss is the equal-weight mean over all five sources (data.eval_weights
+# default), so it's comparable across arms whatever their training weights.
+# Uses the baseline components; once first-batch picks winners, put them in the base (or in every arm).
+
+name: mix-weights
+base: ablation-s
+seeds: [1, 2]
+data:
+  mix: chatbot-v1
+  tokenizer: {type: train, size: 8192}
+arms:
+  natural: {}                       # weights in proportion to how much of each source was collected
+  general-only:                     # control: what the domain sources buy (and cost)
+    data: {weights: {general: 1.0}}
+  v1-guess:                         # the recipe's suggested starting point
+    data: {weights: {general: 0.70, education: 0.10, neurodivergence: 0.08, early_childhood: 0.07, children_stories: 0.05}}
+  domain-heavy:
+    data: {weights: {general: 0.55, education: 0.15, neurodivergence: 0.12, early_childhood: 0.10, children_stories: 0.08}}
